@@ -1,0 +1,31 @@
+# Personal agent/editor overrides (keep shared config in .claude/settings.json)
+.claude/settings.local.json
+
+# Harness local state: the knowledge-store DB and session checkpoints are per-machine
+.harness/
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+build/
+.next/
+
+# Rust / Go
+target/
+bin/
+
+# OS / misc
+.DS_Store
+*.log

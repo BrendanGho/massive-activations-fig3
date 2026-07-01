@@ -1,0 +1,30 @@
+# Example spec: a simple todo API
+# Run: harness run examples/todo_api.yaml -w ./output --provider api
+
+goal: "Build a REST API for managing todo items with CRUD operations"
+
+context: |
+  Simple FastAPI application with in-memory storage.
+  No database needed — just a dict keyed by ID.
+  Focus on correctness and clean contracts between layers.
+
+acceptance_criteria:
+  - "GET /todos returns all todos as a JSON array"
+  - "POST /todos creates a new todo and returns it with an assigned ID"
+  - "GET /todos/{id} returns a single todo or 404"
+  - "PUT /todos/{id} updates a todo or returns 404"
+  - "DELETE /todos/{id} removes a todo or returns 404"
+  - "Todo has fields: id (int), title (str), completed (bool)"
+
+constraints:
+  stack: "Python 3.11, FastAPI, Pydantic v2"
+  style: "Type hints everywhere, Google-style docstrings"
+  structure: "Separate files for models, routes, and storage"
+
+harness:
+  smoke_command: "python -c 'from main import app'"
+  max_retries: 3
+  skip_review: false
+  gates:
+    - name: typecheck
+      command: "python -m py_compile main.py"

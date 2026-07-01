@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "harness": {
+      "command": "uv",
+      "args": ["run", "harness-mcp"],
+      "env": {
+        "HARNESS_DB": ".harness/kb.sqlite"
+      }
+    }
+  }
+}
