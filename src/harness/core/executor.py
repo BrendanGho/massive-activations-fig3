@@ -165,15 +165,19 @@ async def execute_stage(
                 outputs = json.loads(response.content)
             except json.JSONDecodeError:
                 last_error = f"Output was not valid JSON. Raw start: {response.content[:200]}"
-                event_log.emit(Event(
-                    kind=EventKind.STAGE_RETRY,
-                    stage_id=stage.id,
-                    message=f"Attempt {attempt + 1}: invalid JSON output",
-                ))
+                event_log.emit(
+                    Event(
+                        kind=EventKind.STAGE_RETRY,
+                        stage_id=stage.id,
+                        message=f"Attempt {attempt + 1}: invalid JSON output",
+                    )
+                )
                 continue
 
         if not isinstance(outputs, dict):
-            last_error = f"Expected a JSON object mapping paths to contents, got {type(outputs).__name__}"
+            last_error = (
+                f"Expected a JSON object mapping paths to contents, got {type(outputs).__name__}"
+            )
             continue
 
         stage.outputs = outputs
@@ -191,12 +195,14 @@ async def execute_stage(
         for gate in gates:
             result = await gate.check(outputs, gate_context)
             gate_results.append(result)
-            event_log.emit(Event(
-                kind=EventKind.GATE_PASS if result.passed else EventKind.GATE_FAIL,
-                stage_id=stage.id,
-                message=f"{gate.name}: {result.message}",
-                data=result.details,
-            ))
+            event_log.emit(
+                Event(
+                    kind=EventKind.GATE_PASS if result.passed else EventKind.GATE_FAIL,
+                    stage_id=stage.id,
+                    message=f"{gate.name}: {result.message}",
+                    data=result.details,
+                )
+            )
             if not result.passed:
                 all_passed = False
 
@@ -204,28 +210,34 @@ async def execute_stage(
             # SUCCESS — checkpoint and tag
             cp = await checkpoint_mgr.create(stage.id, outputs)
             stage.status = StageStatus.PASSED
-            event_log.emit(Event(
-                kind=EventKind.STAGE_PASS,
-                stage_id=stage.id,
-                message=f"Passed on attempt {attempt + 1}",
-                data={"checkpoint": cp.tag},
-            ))
+            event_log.emit(
+                Event(
+                    kind=EventKind.STAGE_PASS,
+                    stage_id=stage.id,
+                    message=f"Passed on attempt {attempt + 1}",
+                    data={"checkpoint": cp.tag},
+                )
+            )
             return True
 
         # FAIL — revert, distill error, retry
         await checkpoint_mgr.revert(stage.id)
         last_error = _distill_error(gate_results)
-        event_log.emit(Event(
-            kind=EventKind.STAGE_RETRY if attempt < stage.max_retries else EventKind.STAGE_FAIL,
-            stage_id=stage.id,
-            message=f"Attempt {attempt + 1} failed, {stage.max_retries - attempt} retries left",
-            data={"distilled_error": last_error},
-        ))
-        event_log.emit(Event(
-            kind=EventKind.ERROR_DISTILL,
-            stage_id=stage.id,
-            message=last_error,
-        ))
+        event_log.emit(
+            Event(
+                kind=EventKind.STAGE_RETRY if attempt < stage.max_retries else EventKind.STAGE_FAIL,
+                stage_id=stage.id,
+                message=f"Attempt {attempt + 1} failed, {stage.max_retries - attempt} retries left",
+                data={"distilled_error": last_error},
+            )
+        )
+        event_log.emit(
+            Event(
+                kind=EventKind.ERROR_DISTILL,
+                stage_id=stage.id,
+                message=last_error,
+            )
+        )
 
         # Escalate to strong model on last retry
         if attempt == stage.max_retries - 1:
@@ -234,11 +246,13 @@ async def execute_stage(
 
     # Exhausted retries
     stage.status = StageStatus.FAILED
-    event_log.emit(Event(
-        kind=EventKind.STAGE_ESCALATE,
-        stage_id=stage.id,
-        message=f"Failed after {stage.max_retries + 1} attempts",
-    ))
+    event_log.emit(
+        Event(
+            kind=EventKind.STAGE_ESCALATE,
+            stage_id=stage.id,
+            message=f"Failed after {stage.max_retries + 1} attempts",
+        )
+    )
     return False
 
 
@@ -275,9 +289,11 @@ async def execute_all(
                     other.status = StageStatus.FAILED
                     other.last_error = f"Upstream stage {stage.id} failed"
 
-    event_log.emit(Event(
-        kind=EventKind.PHASE_END,
-        phase="execute",
-        message=f"{'All passed' if all_passed else 'Some stages failed'}",
-    ))
+    event_log.emit(
+        Event(
+            kind=EventKind.PHASE_END,
+            phase="execute",
+            message=f"{'All passed' if all_passed else 'Some stages failed'}",
+        )
+    )
     return all_passed

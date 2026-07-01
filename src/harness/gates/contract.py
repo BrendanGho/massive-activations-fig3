@@ -95,9 +95,7 @@ class ContractGate(Gate):
                 for fn in sigs.get("functions", []):
                     all_symbols.add(fn.split("(")[0])
             # For non-Python, do text-based matching
-            all_symbols.update(
-                word for word in re.findall(r"\b[A-Za-z_]\w+\b", content)
-            )
+            all_symbols.update(word for word in re.findall(r"\b[A-Za-z_]\w+\b", content))
 
         missing: list[dict[str, str]] = []
         for contract_name in stage_contracts:

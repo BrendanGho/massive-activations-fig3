@@ -57,12 +57,14 @@ def _build_provider(args: argparse.Namespace):
     """Instantiate the right provider based on CLI flags."""
     if args.provider == "cli":
         from harness.providers.claude_cli import ClaudeCliProvider
+
         return ClaudeCliProvider(
             strong_model=args.strong_model or "opus",
             cheap_model=args.cheap_model or "haiku",
         )
     else:
         from harness.providers.anthropic import AnthropicProvider
+
         return AnthropicProvider(
             strong_model=args.strong_model or "claude-sonnet-4-20250514",
             cheap_model=args.cheap_model or "claude-haiku-4-5-20251001",

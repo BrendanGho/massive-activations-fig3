@@ -29,9 +29,7 @@ class CustomCommandGate(Gate):
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
             )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=self._timeout
-            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self._timeout)
         except asyncio.TimeoutError:
             return GateResult(
                 passed=False,

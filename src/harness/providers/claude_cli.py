@@ -51,9 +51,12 @@ class ClaudeCliProvider(Provider):
 
         cmd = [
             self._bin,
-            "-p", prompt,
-            "--model", model,
-            "--output-format", "json",
+            "-p",
+            prompt,
+            "--model",
+            model,
+            "--output-format",
+            "json",
         ]
 
         env = {**os.environ, **self._env}

@@ -39,11 +39,13 @@ class PipelineConfig:
 
     # Phase 2
     default_max_retries: int = 3
-    stage_gates: list[Gate] = field(default_factory=lambda: [
-        SyntaxGate(),
-        ContractGate(),
-        ScopeGate(),
-    ])
+    stage_gates: list[Gate] = field(
+        default_factory=lambda: [
+            SyntaxGate(),
+            ContractGate(),
+            ScopeGate(),
+        ]
+    )
 
     # Phase 3
     smoke_command: str | None = None
@@ -169,18 +171,22 @@ class Pipeline:
 
         except Exception as e:
             logger.exception(f"Pipeline failed with exception: {e}")
-            event_log.emit(Event(
-                kind=EventKind.PIPELINE_END,
-                message=f"Failed: {e}",
-            ))
+            event_log.emit(
+                Event(
+                    kind=EventKind.PIPELINE_END,
+                    message=f"Failed: {e}",
+                )
+            )
             result.success = False
             raise
         finally:
             result.elapsed_seconds = time.time() - start
-            event_log.emit(Event(
-                kind=EventKind.PIPELINE_END,
-                message=f"{'Success' if result.success else 'Failed'} in {result.elapsed_seconds:.1f}s",
-                data=event_log.summary(),
-            ))
+            event_log.emit(
+                Event(
+                    kind=EventKind.PIPELINE_END,
+                    message=f"{'Success' if result.success else 'Failed'} in {result.elapsed_seconds:.1f}s",
+                    data=event_log.summary(),
+                )
+            )
 
         return result

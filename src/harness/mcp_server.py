@@ -76,9 +76,7 @@ def query_findings(
 
 
 @mcp.tool()
-def upsert_entity(
-    type: str, name: str, data: dict[str, Any] | None = None
-) -> dict[str, Any]:
+def upsert_entity(type: str, name: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
     """Create or update a durable node (paper, module, person, ...). Idempotent
     on ``(type, name)``; ``data`` is merged into any existing record.
     """

@@ -84,11 +84,13 @@ def _resolve_cross_file_references(
                             # Could be a submodule
                             sub = f"{node.module}.{alias.name}"
                             if sub not in defined_modules:
-                                issues.append({
-                                    "file": path,
-                                    "import": f"from {node.module} import {alias.name}",
-                                    "reason": f"'{alias.name}' not found in {node.module}",
-                                })
+                                issues.append(
+                                    {
+                                        "file": path,
+                                        "import": f"from {node.module} import {alias.name}",
+                                        "reason": f"'{alias.name}' not found in {node.module}",
+                                    }
+                                )
 
     return issues
 
@@ -114,43 +116,54 @@ async def integrate(
     # 1. Cross-file reference resolution
     ref_issues = _resolve_cross_file_references(all_outputs)
     for issue in ref_issues:
-        issues.append(f"Unresolved import in {issue['file']}: {issue['import']} — {issue['reason']}")
+        issues.append(
+            f"Unresolved import in {issue['file']}: {issue['import']} — {issue['reason']}"
+        )
 
     # 2. Smoke test
     if smoke_command:
         smoke_gate = SmokeTestGate(default_command=smoke_command)
-        result = await smoke_gate.check(all_outputs, {
-            "smoke_command": smoke_command,
-            "workspace_path": str(workspace),
-        })
-        event_log.emit(Event(
-            kind=EventKind.GATE_PASS if result.passed else EventKind.GATE_FAIL,
-            phase="integrate",
-            message=f"smoke_test: {result.message}",
-            data=result.details,
-        ))
+        result = await smoke_gate.check(
+            all_outputs,
+            {
+                "smoke_command": smoke_command,
+                "workspace_path": str(workspace),
+            },
+        )
+        event_log.emit(
+            Event(
+                kind=EventKind.GATE_PASS if result.passed else EventKind.GATE_FAIL,
+                phase="integrate",
+                message=f"smoke_test: {result.message}",
+                data=result.details,
+            )
+        )
         if not result:
             issues.append(f"Smoke test failed: {result.message}")
             if result.details.get("output_tail"):
                 issues.append(f"Output: {result.details['output_tail'][:500]}")
 
     # 3. Extra gates (user-provided)
-    for gate in (extra_gates or []):
+    for gate in extra_gates or []:
         result = await gate.check(all_outputs, {"workspace_path": str(workspace)})
-        event_log.emit(Event(
-            kind=EventKind.GATE_PASS if result.passed else EventKind.GATE_FAIL,
-            phase="integrate",
-            message=f"{gate.name}: {result.message}",
-        ))
+        event_log.emit(
+            Event(
+                kind=EventKind.GATE_PASS if result.passed else EventKind.GATE_FAIL,
+                phase="integrate",
+                message=f"{gate.name}: {result.message}",
+            )
+        )
         if not result:
             issues.append(f"{gate.name}: {result.message}")
 
     passed = len(issues) == 0
-    event_log.emit(Event(
-        kind=EventKind.PHASE_END,
-        phase="integrate",
-        message=f"{'Passed' if passed else f'{len(issues)} issue(s) found'}",
-        data={"issues": issues},
-    ))
+    event_log.emit(
+        Event(
+            kind=EventKind.PHASE_END,
+            phase="integrate",
+            message=f"{'Passed' if passed else f'{len(issues)} issue(s) found'}",
+            data={"issues": issues},
+        )
+    )
 
     return passed

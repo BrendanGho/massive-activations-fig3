@@ -29,3 +29,10 @@ bin/
 # OS / misc
 .DS_Store
 *.log
+
+# Figure 3 pipeline runtime artifacts (activation cache, outputs, plots).
+# These are large and/or machine-specific; point output_dir / activation_cache_dir
+# at a Drive/S3/HF path in configs instead of committing them.
+outputs/
+cache/
+*.npz

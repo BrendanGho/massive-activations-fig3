@@ -97,17 +97,13 @@ def _compact(d: dict[str, Any]) -> dict[str, Any]:
     Removes ``None`` values and empty containers/strings; keeps ``0``/``0.0``/``False``
     (a confidence of ``0.0`` is meaningful). Applied to every row the store returns.
     """
-    return {
-        k: v for k, v in d.items() if v is not None and v != {} and v != [] and v != ""
-    }
+    return {k: v for k, v in d.items() if v is not None and v != {} and v != [] and v != ""}
 
 
 class Store:
     """A blackboard backed by a single SQLite file (or ``:memory:`` for tests)."""
 
-    def __init__(
-        self, path: str | Path = ":memory:", *, check_same_thread: bool = True
-    ) -> None:
+    def __init__(self, path: str | Path = ":memory:", *, check_same_thread: bool = True) -> None:
         self.path = str(path)
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -129,9 +125,7 @@ class Store:
         """
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(findings)")}
         if "seen" not in cols:
-            self._conn.execute(
-                "ALTER TABLE findings ADD COLUMN seen INTEGER NOT NULL DEFAULT 1"
-            )
+            self._conn.execute("ALTER TABLE findings ADD COLUMN seen INTEGER NOT NULL DEFAULT 1")
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_findings_dedup "
                 "ON findings(content, task, entity_id)"
@@ -148,9 +142,7 @@ class Store:
 
     # -- entities ---------------------------------------------------------
 
-    def upsert_entity(
-        self, type: str, name: str, data: dict[str, Any] | None = None
-    ) -> int:
+    def upsert_entity(self, type: str, name: str, data: dict[str, Any] | None = None) -> int:
         """Create an entity, or merge ``data`` into an existing ``(type, name)``.
 
         Returns the entity id. Idempotent on ``(type, name)`` so concurrent
@@ -160,8 +152,7 @@ class Store:
         existing = self.get_entity(type=type, name=name)
         if existing is None:
             cur = self._conn.execute(
-                "INSERT INTO entities(type, name, data, created, updated) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO entities(type, name, data, created, updated) VALUES (?, ?, ?, ?, ?)",
                 (type, name, json.dumps(data or {}), now, now),
             )
             self._conn.commit()
@@ -183,9 +174,7 @@ class Store:
     ) -> dict[str, Any] | None:
         """Fetch one entity by id, or by ``(type, name)``."""
         if id is not None:
-            row = self._conn.execute(
-                "SELECT * FROM entities WHERE id = ?", (id,)
-            ).fetchone()
+            row = self._conn.execute("SELECT * FROM entities WHERE id = ?", (id,)).fetchone()
         elif type is not None and name is not None:
             row = self._conn.execute(
                 "SELECT * FROM entities WHERE type = ? AND name = ?", (type, name)
@@ -194,9 +183,7 @@ class Store:
             raise ValueError("get_entity requires id, or both type and name")
         return self._entity_row(row)
 
-    def list_entities(
-        self, type: str | None = None, limit: int = 50
-    ) -> list[dict[str, Any]]:
+    def list_entities(self, type: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         if type is None:
             rows = self._conn.execute(
                 "SELECT * FROM entities ORDER BY updated DESC LIMIT ?", (limit,)
@@ -233,8 +220,7 @@ class Store:
         """
         now = _now()
         existing = self._conn.execute(
-            "SELECT id, seen FROM findings "
-            "WHERE content = ? AND task IS ? AND entity_id IS ?",
+            "SELECT id, seen FROM findings WHERE content = ? AND task IS ? AND entity_id IS ?",
             (content, task, entity_id),
         ).fetchone()
         if existing is not None:
