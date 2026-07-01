@@ -1,0 +1,42 @@
+# Figure 3 reproduction — default config.
+#
+# Precedence (highest wins): CLI flag  >  FIG3_* env var  >  this file.
+#   - Env override example:   FIG3_TOP_K=12 FIG3_SEED=1 python -m src.stage1_generate_and_cache ...
+#   - CLI override example:    python -m src.stage1_generate_and_cache --set top_k=12 --set seed=1
+#
+# REQUIRED keys are left blank on purpose: the loader fails loudly if any is
+# empty, because this pipeline runs unattended and a silent default path would
+# waste a whole Colab session. Fill them in (or override via env/CLI) before running.
+
+# --- Required paths / ids (must be set) ---------------------------------------
+model_ckpt:            # e.g. "black-forest-labs/FLUX.2-klein" (HF id) or a local dir
+prompt_source:         # 1,600 GenAI-Bench prompts: .txt (one/line) | .json | .jsonl | .parquet, or an HF dataset id
+birefnet_weights:      # e.g. "ZhengPeng7/BiRefNet" (HF id) or a local dir
+output_dir:            # where CSV / plots / qualitative dumps / run_metadata.json land
+activation_cache_dir:  # where the reduced per-prompt cache shards land
+
+# --- Fixed experiment knobs (do NOT sweep; see spec invariants) ---------------
+num_denoising_steps: 4      # FLUX.2-klein few-step schedule; fixed
+resolution: 1024            # square; fixed
+top_k: 12                   # channels selected per layer; fixed
+
+# --- Tunables -----------------------------------------------------------------
+layers: all                 # "all" = auto-detect every transformer block, or a list e.g. [0, 5, 10]
+random_k_trials: 5          # NOT paper-specified — our assumption; logged to run_metadata.json
+seed: 0
+device: cuda                # cuda | cpu
+dtype: bf16                 # bf16 | fp16 | fp32
+batch_size: 1
+num_example_prompts: 8      # how many prompts get qualitative heatmap+mask PNG dumps
+
+# --- Storage / IO -------------------------------------------------------------
+cache_batch_size: 32        # prompts per cache shard file (~25-50 keeps Drive FUSE happy)
+guidance_scale:             # blank => use the pipeline's default for FLUX.2-klein
+
+# --- Colab note ---------------------------------------------------------------
+# Point the two dirs at a Drive mount so writes survive a session ending mid-run:
+#   output_dir:           /content/drive/MyDrive/figure3_repro/outputs
+#   activation_cache_dir: /content/drive/MyDrive/figure3_repro/cache
+# (from google.colab import drive; drive.mount('/content/drive'))
+# To swap storage later (rclone S3/GCS/B2 or a private HF dataset repo), change
+# these values only — no code change.
