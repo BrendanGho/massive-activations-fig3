@@ -76,7 +76,9 @@ class CheckpointManager:
                 full.write_text(content)
 
             await self._run("git", "add", "-A")
-            await self._run("git", "commit", "-m", f"harness: stage {stage_id} passed", "--allow-empty")
+            await self._run(
+                "git", "commit", "-m", f"harness: stage {stage_id} passed", "--allow-empty"
+            )
             _, sha, _ = await self._run("git", "rev-parse", "HEAD")
             await self._run("git", "tag", "-f", tag, sha)
             cp = Checkpoint(stage_id=stage_id, tag=tag, commit_sha=sha)

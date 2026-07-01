@@ -105,23 +105,21 @@ async def review(
 
     # Build the review prompt
     files_text = "\n\n".join(
-        f"### {path}\n```\n{content}\n```"
-        for path, content in sorted(all_outputs.items())
+        f"### {path}\n```\n{content}\n```" for path, content in sorted(all_outputs.items())
     )
 
     contracts_text = "\n\n".join(
-        f"### {c.name}\n```\n{c.body}\n```"
-        for c in dag.contracts.values()
+        f"### {c.name}\n```\n{c.body}\n```" for c in dag.contracts.values()
     )
 
     user_msg = f"""## Original Spec
 Goal: {spec.goal}
 
 Acceptance Criteria:
-{chr(10).join(f'- {c}' for c in spec.acceptance_criteria)}
+{chr(10).join(f"- {c}" for c in spec.acceptance_criteria)}
 
 Constraints:
-{chr(10).join(f'- {k}: {v}' for k, v in spec.constraints.items())}
+{chr(10).join(f"- {k}: {v}" for k, v in spec.constraints.items())}
 
 ## Contracts
 {contracts_text}
@@ -164,11 +162,13 @@ Flag anything NOT in the spec under "over_engineering".
     ]
 
     for finding in findings:
-        event_log.emit(Event(
-            kind=EventKind.REVIEW_FINDING,
-            phase="review",
-            message=f"[{finding.severity}] {finding.category}: {finding.file} — {finding.message}",
-        ))
+        event_log.emit(
+            Event(
+                kind=EventKind.REVIEW_FINDING,
+                phase="review",
+                message=f"[{finding.severity}] {finding.category}: {finding.file} — {finding.message}",
+            )
+        )
 
     report = ReviewReport(
         passed=data.get("passed", len([f for f in findings if f.severity == "blocking"]) == 0),
@@ -176,11 +176,13 @@ Flag anything NOT in the spec under "over_engineering".
         summary=data.get("summary", ""),
     )
 
-    event_log.emit(Event(
-        kind=EventKind.PHASE_END,
-        phase="review",
-        message=f"{'Passed' if report.passed else 'Blocking issues found'}: {report.summary}",
-        data={"blocking": len(report.blocking), "total_findings": len(findings)},
-    ))
+    event_log.emit(
+        Event(
+            kind=EventKind.PHASE_END,
+            phase="review",
+            message=f"{'Passed' if report.passed else 'Blocking issues found'}: {report.summary}",
+            data={"blocking": len(report.blocking), "total_findings": len(findings)},
+        )
+    )
 
     return report

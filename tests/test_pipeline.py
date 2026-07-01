@@ -99,13 +99,15 @@ REVIEW_RESPONSE = {
 async def test_full_pipeline(tmp_path: Path):
     """End-to-end test: plan → execute → integrate → review with mock provider."""
 
-    provider = MockProvider([
-        PLAN_RESPONSE,       # Phase 1: plan
-        PLAN_VALIDATION_RESPONSE,  # Phase 1: validate
-        STAGE_1_RESPONSE,    # Phase 2: stage 1
-        STAGE_2_RESPONSE,    # Phase 2: stage 2
-        REVIEW_RESPONSE,     # Phase 4: review
-    ])
+    provider = MockProvider(
+        [
+            PLAN_RESPONSE,  # Phase 1: plan
+            PLAN_VALIDATION_RESPONSE,  # Phase 1: validate
+            STAGE_1_RESPONSE,  # Phase 2: stage 1
+            STAGE_2_RESPONSE,  # Phase 2: stage 2
+            REVIEW_RESPONSE,  # Phase 4: review
+        ]
+    )
 
     spec = Spec(
         goal="Build a user API",
@@ -147,13 +149,15 @@ async def test_full_pipeline(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_pipeline_skip_review(tmp_path: Path):
-    provider = MockProvider([
-        PLAN_RESPONSE,
-        PLAN_VALIDATION_RESPONSE,
-        STAGE_1_RESPONSE,
-        STAGE_2_RESPONSE,
-        # No review response needed
-    ])
+    provider = MockProvider(
+        [
+            PLAN_RESPONSE,
+            PLAN_VALIDATION_RESPONSE,
+            STAGE_1_RESPONSE,
+            STAGE_2_RESPONSE,
+            # No review response needed
+        ]
+    )
 
     spec = Spec(goal="Build a user API", acceptance_criteria=["User class exists"])
     config = PipelineConfig(skip_review=True, validate_plan=True)

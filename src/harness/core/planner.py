@@ -29,8 +29,15 @@ PLAN_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["id", "name", "description", "owned_files", "depends_on",
-                             "acceptance_criteria", "contracts"],
+                "required": [
+                    "id",
+                    "name",
+                    "description",
+                    "owned_files",
+                    "depends_on",
+                    "acceptance_criteria",
+                    "contracts",
+                ],
                 "properties": {
                     "id": {"type": "string"},
                     "name": {"type": "string"},
@@ -49,7 +56,10 @@ PLAN_SCHEMA: dict[str, Any] = {
                 "required": ["name", "body", "producers", "consumers"],
                 "properties": {
                     "name": {"type": "string"},
-                    "body": {"type": "string", "description": "Code or structured text defining the interface. Signatures, types, schemas — not prose."},
+                    "body": {
+                        "type": "string",
+                        "description": "Code or structured text defining the interface. Signatures, types, schemas — not prose.",
+                    },
                     "producers": {"type": "array", "items": {"type": "string"}},
                     "consumers": {"type": "array", "items": {"type": "string"}},
                 },
@@ -91,12 +101,12 @@ async def plan(
 {spec.context}
 
 ## Acceptance Criteria
-{chr(10).join(f'- {c}' for c in spec.acceptance_criteria)}
+{chr(10).join(f"- {c}" for c in spec.acceptance_criteria)}
 
 ## Constraints
-{chr(10).join(f'- {k}: {v}' for k, v in spec.constraints.items())}
+{chr(10).join(f"- {k}: {v}" for k, v in spec.constraints.items())}
 
-{f'## Additional Context{chr(10)}{extra_context}' if extra_context else ''}
+{f"## Additional Context{chr(10)}{extra_context}" if extra_context else ""}
 
 Produce a JSON plan with `stages` and `contracts` arrays.
 Each stage: id, name, description, owned_files (glob patterns OK), depends_on (stage IDs),
@@ -120,40 +130,48 @@ Each contract: name, body (CODE defining the interface), producers (stage IDs), 
         try:
             data = json.loads(response.content)
         except json.JSONDecodeError:
-            raise ValueError(f"Plan generation failed to produce valid JSON:\n{response.content[:500]}")
+            raise ValueError(
+                f"Plan generation failed to produce valid JSON:\n{response.content[:500]}"
+            )
 
     dag = StageDag()
 
     # Build contracts first
     for c in data.get("contracts", []):
-        dag.add_contract(Contract(
-            name=c["name"],
-            body=c["body"],
-            producers=c.get("producers", []),
-            consumers=c.get("consumers", []),
-        ))
+        dag.add_contract(
+            Contract(
+                name=c["name"],
+                body=c["body"],
+                producers=c.get("producers", []),
+                consumers=c.get("consumers", []),
+            )
+        )
 
     # Build stages
     for s in data.get("stages", []):
-        dag.add_stage(Stage(
-            id=s["id"],
-            name=s["name"],
-            description=s["description"],
-            owned_files=s.get("owned_files", []),
-            depends_on=s.get("depends_on", []),
-            acceptance_criteria=s.get("acceptance_criteria", []),
-            contracts=s.get("contracts", []),
-        ))
+        dag.add_stage(
+            Stage(
+                id=s["id"],
+                name=s["name"],
+                description=s["description"],
+                owned_files=s.get("owned_files", []),
+                depends_on=s.get("depends_on", []),
+                acceptance_criteria=s.get("acceptance_criteria", []),
+                contracts=s.get("contracts", []),
+            )
+        )
 
     # Validate: no cycles, all dependencies exist
     dag.topological_order()
 
-    event_log.emit(Event(
-        kind=EventKind.PHASE_END,
-        phase="plan",
-        message=f"{len(dag.stages)} stages, {len(dag.contracts)} contracts",
-        data={"stages": list(dag.stages.keys()), "contracts": list(dag.contracts.keys())},
-    ))
+    event_log.emit(
+        Event(
+            kind=EventKind.PHASE_END,
+            phase="plan",
+            message=f"{len(dag.stages)} stages, {len(dag.contracts)} contracts",
+            data={"stages": list(dag.stages.keys()), "contracts": list(dag.contracts.keys())},
+        )
+    )
 
     return dag
 
@@ -178,7 +196,10 @@ async def validate_plan(
     )
 
     request = GenerateRequest(
-        messages=[Message(role="user", content=f"""Review this plan for issues:
+        messages=[
+            Message(
+                role="user",
+                content=f"""Review this plan for issues:
 
 ## Contracts
 {contracts_text}
@@ -193,7 +214,9 @@ Check for:
 4. Acceptance criteria that can't be tested mechanically
 
 Return a JSON array of warning strings. Return [] if the plan looks correct.
-""")],
+""",
+            )
+        ],
         system="You are a plan reviewer. Be precise and concise. Only flag real issues.",
         tier=ModelTier.CHEAP,
         output_schema={"type": "array", "items": {"type": "string"}},
