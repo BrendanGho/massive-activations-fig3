@@ -1,4 +1,4 @@
-# Reproduce Figure 3 — Massive Activations in Diffusion Transformers (FLUX.2-klein)
+# Fig 3 — Massive Activations in Diffusion Transformers (FLUX.2-klein)
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/BrendanGho/massive-activations-fig3/blob/main/Figure3_Colab.ipynb)
 
