@@ -33,8 +33,13 @@ def torch_dtype(dtype_str: str):
 # --- pipeline / model loading -------------------------------------------------
 
 
-def load_pipeline(cfg) -> Any:
-    """Load the FLUX.2-klein diffusion pipeline onto the configured device/dtype."""
+def load_pipeline(cfg, offload: bool = False) -> Any:
+    """Load the FLUX diffusion pipeline onto the configured device/dtype.
+
+    ``offload=True`` uses ``enable_model_cpu_offload`` instead of moving the whole
+    pipeline onto ``cfg.device`` — needed to fit large checkpoints (e.g. the 12B
+    FLUX.1-dev) on smaller GPUs, at the cost of speed.
+    """
     from diffusers import DiffusionPipeline
 
     dtype = torch_dtype(cfg.dtype)
@@ -45,7 +50,10 @@ def load_pipeline(cfg) -> Any:
         pipe = DiffusionPipeline.from_pretrained(
             cfg.model_ckpt, torch_dtype=dtype, trust_remote_code=True
         )
-    pipe = pipe.to(cfg.device)
+    if offload:
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe = pipe.to(cfg.device)
     try:
         pipe.set_progress_bar_config(disable=True)
     except Exception:

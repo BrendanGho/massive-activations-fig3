@@ -1,0 +1,39 @@
+# Per-generation channel-stability experiment (FLUX.1-dev).
+#
+# Loaded by src/experiments/channel_stability.py (NOT the fig3 config loader). Question:
+# for each (prompt, seed) generation, which channels are largest, and do their identities
+# change across generations? We fix one block + the last timestep and vary prompt × seed.
+#
+#   python -m src.experiments.channel_stability --config configs/channel_stability.yaml
+
+# --- required -----------------------------------------------------------------
+model_ckpt: black-forest-labs/FLUX.1-dev   # gated: accept the license + set HF_TOKEN
+output_dir:                                 # where tables / stability summary / dumps land
+
+# --- FLUX.1-dev generation (standard dev settings) ----------------------------
+resolution: 1024
+num_denoising_steps: 50
+guidance_scale: 3.5
+dtype: bf16          # bf16 | fp16 | fp32  (bf16 needs Ampere+; T4 -> fp16)
+device: cuda
+offload: false       # true => enable_model_cpu_offload (fits the 12B model on <24GB GPUs, slower)
+
+# --- fixed probe point (constant across scenarios) ----------------------------
+fixed_layer: 11      # paper reports this layer works best; a double-stream block (0..18)
+
+# --- scenarios: cross-product of prompts × seeds ------------------------------
+# same prompt / different seed  -> generation-to-generation identity jitter
+# different prompt              -> content dependence of the top channels
+prompts:
+  - a red bicycle leaning against a brick wall
+  - a golden retriever sitting on a wooden dock at sunset
+  - a bowl of fresh strawberries on a marble countertop
+  - an astronaut planting a flag on the moon
+seeds: [0, 1, 2]
+
+# --- ranking / outputs --------------------------------------------------------
+top_n: 20            # ordered top-20 saved per scenario; top-1/5/10 are prefixes
+agg_k: 10            # channels combined into the aggregated heatmap
+n_channel_maps: 5    # per-channel spatial maps dumped for representative scenarios
+n_control_maps: 0    # optional low-ranked control maps (same count); 0 disables
+representative_scenarios:   # scenario_ids to dump qualitatively; blank => first 3
