@@ -1,10 +1,10 @@
-# Fig 3 — Massive Activations in Diffusion Transformers (FLUX.2-klein)
+# Fig 3 — Massive Activations in Diffusion Transformers 
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/BrendanGho/massive-activations-fig3/blob/main/Figure3_Colab.ipynb)
 
 Reproduction of **Figure 3 / Section 3.2** of *"Few Channels Draw The Whole
 Picture: Revealing Massive Activations in Diffusion Transformers"*
-(arXiv:2605.13974) for **FLUX.2-klein**. (Not the Section 3.1 disruption experiment.)
+(arXiv:2605.13974) for FLUX.2-klein. (Not the Section 3.1 disruption experiment.)
 
 The claim under test: a tiny number of "massive-activation" channels in a diffusion
 transformer already localize the image subject. Selecting the **top-k** such channels
