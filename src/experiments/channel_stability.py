@@ -393,16 +393,20 @@ def run(cfg: ScenarioConfig) -> dict[str, Any]:
     from src.common import model_utils
 
     scenarios = build_scenarios(cfg.prompts, cfg.seeds)
+    # Default representative scenarios: the first (up to) 3 DISTINCT prompts at their first
+    # seed, so the qualitative dumps show different content (not one prompt at three seeds).
+    n_seeds = len(cfg.seeds)
     rep = (
         set(cfg.representative_scenarios)
         if cfg.representative_scenarios is not None
-        else set(sc.scenario_id for sc in scenarios[:3])
+        else {p * n_seeds for p in range(min(3, len(cfg.prompts)))}
     )
     write_run_metadata(cfg, scenarios, model_info=None)
 
     pipe = model_utils.load_pipeline(cfg, offload=cfg.offload)
     transformer = pipe.transformer
-    blocks = model_utils.select_layers(model_utils.discover_blocks(transformer), [cfg.fixed_layer])
+    all_blocks = model_utils.discover_blocks(transformer)
+    blocks = model_utils.select_layers(all_blocks, [cfg.fixed_layer])
     state = model_utils.CaptureState()
     handles = model_utils.register_capture_hooks(transformer, blocks, state)
 
@@ -440,7 +444,7 @@ def run(cfg: ScenarioConfig) -> dict[str, Any]:
                     cfg,
                     scenarios,
                     model_info={
-                        "n_layers": len(model_utils.discover_blocks(transformer)),
+                        "n_layers": len(all_blocks),
                         "fixed_layer": cfg.fixed_layer,
                         "d": d,
                         "n_image_tokens": info["n_image"],

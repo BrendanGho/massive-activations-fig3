@@ -36,4 +36,4 @@ top_n: 20            # ordered top-20 saved per scenario; top-1/5/10 are prefixe
 agg_k: 10            # channels combined into the aggregated heatmap
 n_channel_maps: 5    # per-channel spatial maps dumped for representative scenarios
 n_control_maps: 0    # optional low-ranked control maps (same count); 0 disables
-representative_scenarios:   # scenario_ids to dump qualitatively; blank => first 3
+representative_scenarios:   # scenario_ids to dump qualitatively; blank => first 3 distinct prompts (seed 0)
