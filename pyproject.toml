@@ -28,6 +28,15 @@ fig3 = [
     "pillow>=10.0",
     "matplotlib>=3.8",
     "tqdm>=4.66",
+    # prompt_source lazy paths (src/common/io.py): HF dataset id -> `datasets`;
+    # .parquet -> `pandas` + a parquet engine (`pyarrow`).
+    "datasets>=2.19",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    # Commonly required by FLUX's T5 text-encoder tokenizer and BiRefNet configs;
+    # not imported directly in this repo's code but needed transitively at load time.
+    "sentencepiece>=0.2.0",
+    "protobuf>=4.25",
 ]
 
 [project.scripts]
