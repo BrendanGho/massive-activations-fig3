@@ -9,7 +9,7 @@
 # waste a whole Colab session. Fill them in (or override via env/CLI) before running.
 
 # --- Required paths / ids (must be set) ---------------------------------------
-model_ckpt:            # e.g. "black-forest-labs/FLUX.2-klein" (HF id) or a local dir
+model_ckpt:            # e.g. "black-forest-labs/FLUX.2-klein-4B" (ungated) or "-9B" (gated), HF id or local dir
 prompt_source:         # 1,600 GenAI-Bench prompts: .txt (one/line) | .json | .jsonl | .parquet, or an HF dataset id
 birefnet_weights:      # e.g. "ZhengPeng7/BiRefNet" (HF id) or a local dir
 output_dir:            # where CSV / plots / qualitative dumps / run_metadata.json land
@@ -26,6 +26,7 @@ random_k_trials: 5          # NOT paper-specified — our assumption; logged to 
 seed: 0
 device: cuda                # cuda | cpu
 dtype: bf16                 # bf16 | fp16 | fp32
+offload: false              # true => enable_model_cpu_offload (fits FLUX.2-klein-4B on <24GB GPUs, e.g. T4/16GB; slower)
 batch_size: 1
 num_example_prompts: 8      # how many prompts get qualitative heatmap+mask PNG dumps
 

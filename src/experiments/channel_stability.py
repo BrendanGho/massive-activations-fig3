@@ -351,24 +351,13 @@ def dump_scenario_qualitative(
 # --- metadata -----------------------------------------------------------------
 
 
-def _versions() -> dict:
-    out = {}
-    for name in ("numpy", "sklearn", "torch", "diffusers", "transformers"):
-        try:
-            mod = __import__(name)
-            out[name] = getattr(mod, "__version__", "unknown")
-        except Exception:
-            out[name] = "not installed"
-    return out
-
-
 def write_run_metadata(
     cfg: ScenarioConfig, scenarios: list[Scenario], model_info: dict | None
 ) -> str:
     meta = {
         "experiment": "channel_stability",
         "resolved_config": cfg.to_dict(),
-        "versions": _versions(),
+        "versions": io.package_versions(),
         "n_scenarios": len(scenarios),
         "assumptions": {
             "score": "abs(mean_over_tokens) — mean then abs (fig3 massive-activation score)",

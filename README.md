@@ -54,7 +54,7 @@ Fill the five **required** keys in `configs/default.yaml` (or override them — 
 
 | key | example |
 |---|---|
-| `model_ckpt` | `black-forest-labs/FLUX.2-klein` (HF id or local dir) |
+| `model_ckpt` | `black-forest-labs/FLUX.2-klein-4B` (ungated) or `-9B` (gated) — HF id or local dir |
 | `prompt_source` | 1,600 GenAI-Bench prompts: `.txt` / `.json` / `.jsonl` / `.parquet`, or an HF dataset id |
 | `birefnet_weights` | `ZhengPeng7/BiRefNet` |
 | `output_dir` | where CSV / plots / qualitative / `run_metadata.json` land |
@@ -79,6 +79,10 @@ python -m src.stage4_evaluate_figure3d  --config configs/default.yaml
 # or the resumable wrapper (skips already-cached prompts)
 scripts/run_pipeline.sh configs/default.yaml
 ```
+
+`FLUX.2-klein-4B` is ~16 GB in half precision (Qwen3-4B text encoder + 4B transformer),
+so it needs a ≥24 GB GPU to load fully; on a 16 GB T4 set `offload: true` (or `--set
+offload=true`) to enable `enable_model_cpu_offload` (fits, slower).
 
 **Fused mode** (default) runs Stages 2+3 in-process right after each capture and persists
 only small reduced artifacts (scores, channel indices, binary masks, decoded RGB,

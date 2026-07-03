@@ -27,22 +27,12 @@ from src.stage2_channel_ranking import rank_channels
 from src.stage3_mask_construction import build_prompt_record, save_qualitative_dump
 
 
-def _versions() -> dict:
-    out = {}
-    for name in ("numpy", "sklearn", "torch", "diffusers", "transformers"):
-        try:
-            mod = __import__(name)
-            out[name] = getattr(mod, "__version__", "unknown")
-        except Exception:
-            out[name] = "not installed"
-    return out
-
-
 def write_run_metadata(cfg: Config, prompts: list[str], model_info: dict | None) -> str:
     """Log resolved config + ambiguity choices + provenance to run_metadata.json."""
+    versions = io.package_versions()
     meta = {
         "resolved_config": {k: v for k, v in cfg.to_dict().items()},
-        "versions": _versions(),
+        "versions": versions,
         "prompt_source": {
             "path": cfg.prompt_source,
             "n_prompts": len(prompts),
@@ -54,7 +44,7 @@ def write_run_metadata(cfg: Config, prompts: list[str], model_info: dict | None)
             "random_k_note": "not paper-specified; our default",
             "kmeans": {
                 "library": "scikit-learn",
-                "version": _versions().get("sklearn"),
+                "version": versions.get("sklearn"),
                 "init": "library default (k-means++)",
                 "n_init": "library default",
                 "random_state": "derived per (seed, prompt_id, layer, strategy)",
@@ -106,7 +96,7 @@ def run(cfg: Config, fused: bool, limit: int | None, skip_cached: bool) -> None:
 
     from src.common import model_utils
 
-    pipe = model_utils.load_pipeline(cfg)
+    pipe = model_utils.load_pipeline(cfg, offload=cfg.offload)
     transformer = pipe.transformer
     blocks = model_utils.select_layers(model_utils.discover_blocks(transformer), cfg.layers)
     state = model_utils.CaptureState()

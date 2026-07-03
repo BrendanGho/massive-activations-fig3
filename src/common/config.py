@@ -47,6 +47,7 @@ class Config:
     seed: int = 0
     device: str = "cuda"
     dtype: str = "bf16"
+    offload: bool = False  # enable_model_cpu_offload (fits FLUX.2-klein on <24GB GPUs, slower)
     batch_size: int = 1
     num_example_prompts: int = 8
 
@@ -79,6 +80,13 @@ _STR_FIELDS = {
     "device",
     "dtype",
 }
+_BOOL_FIELDS = {"offload"}
+
+
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _parse_layers(value: Any) -> Any:
@@ -108,6 +116,8 @@ def _coerce(key: str, value: Any) -> Any:
         if isinstance(value, str) and value.strip() == "":
             return None
         return float(value)
+    if key in _BOOL_FIELDS:
+        return _parse_bool(value)
     if key in _INT_FIELDS:
         return int(value)
     if key in _STR_FIELDS:

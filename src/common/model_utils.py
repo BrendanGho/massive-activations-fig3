@@ -298,7 +298,11 @@ def birefnet_mask(
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     )
-    x = tfm(rgb).unsqueeze(0).to(cfg.device, torch_dtype(cfg.dtype))
+    # Match the input to BiRefNet's actual weight dtype (load_birefnet keeps it fp32).
+    # Casting to cfg.dtype instead would feed fp16/bf16 activations into fp32 conv
+    # weights -> "Input type and bias type should be the same" RuntimeError on GPU runs.
+    model_dtype = next(model.parameters()).dtype
+    x = tfm(rgb).unsqueeze(0).to(cfg.device, model_dtype)
     with torch.no_grad():
         preds = model(x)
         logits = preds[-1] if isinstance(preds, (list, tuple)) else preds

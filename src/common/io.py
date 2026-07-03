@@ -307,6 +307,22 @@ def _meta_kwargs(meta: dict[str, Any]) -> dict[str, Any]:
 # --- misc json ----------------------------------------------------------------
 
 
+def package_versions() -> dict[str, str]:
+    """Version strings for the provenance block in run_metadata.json.
+
+    Imports lazily and swallows failures so it works in the torch-free core too
+    (missing deps report "not installed" rather than raising).
+    """
+    out: dict[str, str] = {}
+    for name in ("numpy", "sklearn", "torch", "diffusers", "transformers"):
+        try:
+            mod = __import__(name)
+            out[name] = getattr(mod, "__version__", "unknown")
+        except Exception:
+            out[name] = "not installed"
+    return out
+
+
 def save_json(path: str, obj: Any) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as fh:
