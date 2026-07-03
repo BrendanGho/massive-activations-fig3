@@ -54,6 +54,19 @@ def upsample_nearest_2d(arr: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
 # --- prompt loading -----------------------------------------------------------
 
 
+def _match_key(available: Any, candidates: tuple[str, ...]) -> str | None:
+    """Return the actual key/column matching any candidate, case-insensitively.
+
+    Lets us accept e.g. GenAI-Bench's ``Prompt`` column (capital P) against the
+    lowercase candidate ``prompt``, while returning the original name for indexing.
+    """
+    lower = {str(a).lower(): a for a in available}
+    for cand in candidates:
+        if cand in lower:
+            return lower[cand]
+    return None
+
+
 def load_prompts(prompt_source: str) -> list[str]:
     """Load prompts from .txt / .json / .jsonl / .parquet, or an HF dataset id.
 
@@ -94,9 +107,9 @@ def load_prompts(prompt_source: str) -> list[str]:
             f"is not available to treat it as an HF id ({exc})."
         )
     ds = load_dataset(prompt_source, split="train")
-    for col in ("prompt", "text", "caption"):
-        if col in ds.column_names:
-            return [str(x) for x in ds[col]]
+    col = _match_key(ds.column_names, ("prompt", "text", "caption"))
+    if col is not None:
+        return [str(x) for x in ds[col]]
     raise ValueError(
         f"Could not find a prompt column in HF dataset {prompt_source!r}; "
         f"columns: {ds.column_names}"
@@ -107,27 +120,26 @@ def _extract_prompt_scalar(obj: Any) -> str:
     if isinstance(obj, str):
         return obj
     if isinstance(obj, dict):
-        for key in ("prompt", "text", "caption"):
-            if key in obj:
-                return str(obj[key])
+        key = _match_key(obj.keys(), ("prompt", "text", "caption"))
+        if key is not None:
+            return str(obj[key])
     raise ValueError(f"Cannot extract a prompt from record: {obj!r}")
 
 
 def _extract_prompt_list(data: Any) -> list[str]:
     if isinstance(data, dict):
-        for key in ("prompts", "prompt", "data"):
-            if key in data:
-                data = data[key]
-                break
+        key = _match_key(data.keys(), ("prompts", "prompt", "data"))
+        if key is not None:
+            data = data[key]
     if not isinstance(data, list):
         raise ValueError("JSON prompt file must be a list (or {prompts: [...]}).")
     return [_extract_prompt_scalar(x) for x in data]
 
 
 def _extract_prompts_from_columns(df: Any) -> list[str]:
-    for col in ("prompt", "text", "caption"):
-        if col in df.columns:
-            return [str(x) for x in df[col].tolist()]
+    col = _match_key(df.columns, ("prompt", "text", "caption"))
+    if col is not None:
+        return [str(x) for x in df[col].tolist()]
     raise ValueError(f"No prompt column found in parquet; columns: {list(df.columns)}")
 
 
