@@ -55,7 +55,7 @@ Fill the five **required** keys in `configs/default.yaml` (or override them — 
 | key | example |
 |---|---|
 | `model_ckpt` | `black-forest-labs/FLUX.2-klein-4B` (ungated) or `-9B` (gated) — HF id or local dir |
-| `prompt_source` | 1,600 GenAI-Bench prompts: `.txt` / `.json` / `.jsonl` / `.parquet`, or an HF dataset id |
+| `prompt_source` | 1,600 GenAI-Bench prompts; defaults to the bundled `data/genai_prompts.jsonl` — or point it at another `.txt` / `.json` / `.jsonl` / `.parquet` file, or an HF dataset id |
 | `birefnet_weights` | `ZhengPeng7/BiRefNet` |
 | `output_dir` | where CSV / plots / qualitative / `run_metadata.json` land |
 | `activation_cache_dir` | where reduced cache shards land |

@@ -10,7 +10,7 @@
 
 # --- Required paths / ids (must be set) ---------------------------------------
 model_ckpt:            # e.g. "black-forest-labs/FLUX.2-klein-4B" (ungated) or "-9B" (gated), HF id or local dir
-prompt_source:         # 1,600 GenAI-Bench prompts: .txt (one/line) | .json | .jsonl | .parquet, or an HF dataset id
+prompt_source: data/genai_prompts.jsonl  # 1,600 GenAI-Bench prompts, bundled locally (.txt/.json/.jsonl/.parquet, or an HF dataset id also accepted)
 birefnet_weights:      # e.g. "ZhengPeng7/BiRefNet" (HF id) or a local dir
 output_dir:            # where CSV / plots / qualitative dumps / run_metadata.json land
 activation_cache_dir:  # where the reduced per-prompt cache shards land
