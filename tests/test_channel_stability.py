@@ -123,6 +123,248 @@ def test_topk_ordering_via_rank_channels():
     assert list(res.top_idx[:3]) == [0, 4, 2]  # top-3 prefix
 
 
+def test_compute_stability_summary_pair_lists():
+    scs = cs.build_scenarios(["p0", "p1", "p2", "p3"], [0, 1, 2])  # 4 prompts x 3 seeds
+    top = {sc.scenario_id: np.arange(sc.prompt_id * 5, sc.prompt_id * 5 + 5) for sc in scs}
+    summ = cs.compute_stability_summary(scs, top, d=100, n_seeds=3)
+    k5 = summ["per_k"]["5"]
+    # 4 prompts x C(3,2)=3 same-prompt pairs; C(12,2)=66 total -> 54 diff-prompt pairs.
+    assert len(k5["pairs_same_prompt"]) == 12
+    assert len(k5["pairs_diff_prompt"]) == 54
+    assert k5["mean_jaccard_same_prompt_diff_seed"] == pytest.approx(
+        np.mean(k5["pairs_same_prompt"])
+    )
+    assert k5["mean_jaccard_diff_prompt"] == pytest.approx(np.mean(k5["pairs_diff_prompt"]))
+
+
+# --- secondary (token-localized) metric ----------------------------------------
+
+
+def test_channel_scores_max_catches_localized_channel():
+    from src.stage2_channel_ranking import channel_scores, channel_scores_max
+
+    rng = np.random.default_rng(0)
+    stream = rng.normal(0, 0.1, size=(1000, 8))
+    stream[:, 3] += 0.5  # uniformly shifted channel -> wins under mean-abs
+    stream[7, 5] = 100.0  # single-token massive channel -> invisible to the mean
+
+    mean_top = int(np.argmax(channel_scores(stream)))
+    max_top = int(np.argmax(channel_scores_max(stream, q=1.0)))
+    assert mean_top == 3
+    assert max_top == 5
+
+    # q=1.0 equals the per-channel abs max exactly.
+    assert np.allclose(channel_scores_max(stream, q=1.0), np.abs(stream).max(axis=0))
+
+    with pytest.raises(ValueError):
+        channel_scores_max(stream, q=0.0)
+
+
+def test_rank_channels_secondary_ordering():
+    stream = np.zeros((10, 4))
+    stream[0, 2] = 50.0
+    stream[1, 0] = 10.0
+    top_idx, scores = cs.rank_channels_secondary(stream, "max", top_n=4)
+    assert list(top_idx[:2]) == [2, 0]
+    assert scores.shape == (4,)
+
+
+def test_compute_metric_agreement():
+    scs = cs.build_scenarios(["a"], [0])
+    primary = {0: np.arange(20)}
+    secondary = {0: np.arange(20)}
+    agree = cs.compute_metric_agreement(scs, primary, secondary)
+    assert all(v == 1.0 for v in agree.values())
+    secondary = {0: np.arange(100, 120)}
+    agree = cs.compute_metric_agreement(scs, primary, secondary)
+    assert all(v == 0.0 for v in agree.values())
+
+
+# --- multi-step capture ---------------------------------------------------------
+
+
+def test_compute_step_consistency():
+    scs = cs.build_scenarios(["a", "b"], [0])  # 2 scenarios
+    last = {0: np.arange(20), 1: np.arange(20)}
+    steps = {
+        0: {0: np.arange(20), 24: np.arange(100, 120)},  # step 0 identical, step 24 disjoint
+        1: {0: np.arange(20), 24: np.arange(100, 120)},
+    }
+    out = cs.compute_step_consistency(scs, last, steps)
+    assert out["0"]["20"] == pytest.approx(1.0)
+    assert out["24"]["20"] == pytest.approx(0.0)
+
+
+def test_capture_state_step_streams():
+    torch = pytest.importorskip("torch")
+    from src.common import model_utils
+
+    state = model_utils.CaptureState(capture_steps={0, 2})
+    n_image, d = 4, 3
+
+    class Block(torch.nn.Module):
+        def forward(self, x):
+            return x
+
+    block = Block()
+    refs = [model_utils.BlockRef(layer_id=7, module=block, kind="double")]
+
+    class Transformer(torch.nn.Module):
+        def forward(self, hidden_states):
+            return block(hidden_states)
+
+    tr = Transformer()
+    handles = model_utils.register_capture_hooks(tr, refs, state)
+    try:
+        for step in range(3):
+            tr(torch.full((1, n_image, d), float(step)))
+    finally:
+        for h in handles:
+            h.remove()
+
+    # Last-step buffer always holds the final forward; step snapshots only 0 and 2.
+    assert np.allclose(state.image_streams[7], 2.0)
+    assert set(state.step_streams) == {(0, 7), (2, 7)}
+    assert np.allclose(state.step_streams[(0, 7)], 0.0)
+
+    state.reset()
+    assert state.capture_steps == {0, 2}  # request survives reset
+    assert state.step_streams == {}
+
+
+# --- figures (Agg backend, synthetic data) --------------------------------------
+
+
+def _synthetic_run_data(n_prompts=2, n_seeds=2, d=16, top_n=4):
+    scs = cs.build_scenarios([f"prompt {i}" for i in range(n_prompts)], list(range(n_seeds)))
+    rng = np.random.default_rng(1)
+    top = {sc.scenario_id: rng.permutation(d)[:top_n] for sc in scs}
+    scores = {sc.scenario_id: rng.uniform(1, 10, size=d) for sc in scs}
+    return scs, top, scores
+
+
+def test_scenario_channel_heatmap_renders(tmp_path):
+    pytest.importorskip("matplotlib")
+    scs, top, scores = _synthetic_run_data()
+    channels, rank_of, _ = cs.build_scenario_channel_matrix(scs, top, scores)
+    path = str(tmp_path / "heat.png")
+    cs._save_scenario_channel_heatmap(path, scs, channels, rank_of, top_n=4, n_seeds=2)
+    assert (tmp_path / "heat.png").stat().st_size > 0
+
+
+def test_stability_overlap_renders(tmp_path):
+    pytest.importorskip("matplotlib")
+    from src.common import spatial as sp
+
+    scs, top, _ = _synthetic_run_data()
+    summ = cs.compute_stability_summary(scs, top, d=16, n_seeds=2)
+    mat = sp.pairwise_jaccard_matrix([top[sc.scenario_id] for sc in scs])
+    path = str(tmp_path / "overlap.png")
+    cs._save_stability_overlap(path, mat, 4, scs, 2, summ)
+    assert (tmp_path / "overlap.png").stat().st_size > 0
+
+
+def test_step_consistency_figure_renders(tmp_path):
+    pytest.importorskip("matplotlib")
+    per_step = {"0": {"1": 0.5, "5": 0.6}, "24": {"1": 0.9, "5": 0.8}}
+    path = str(tmp_path / "steps.png")
+    cs._save_step_consistency(path, per_step, n_steps=50)
+    assert (tmp_path / "steps.png").stat().st_size > 0
+
+
+def test_contact_sheet_renders(tmp_path):
+    pytest.importorskip("matplotlib")
+    rng = np.random.default_rng(2)
+    scs = cs.build_scenarios(["a tiny prompt"], [0])
+    rows = [
+        {
+            "sc": scs[0],
+            "rgb": rng.integers(0, 255, size=(8, 8, 3), dtype=np.uint8),
+            "stream": rng.normal(size=(16, 8)),
+            "top_idx": np.arange(8),
+            "bottom_idx": np.arange(8)[::-1].copy(),
+            "scores": rng.uniform(1, 10, size=8),
+        }
+    ]
+    path = str(tmp_path / "sheet.png")
+    cs._save_contact_sheet(path, rows, agg_k=3, h_lat=4, w_lat=4)
+    assert (tmp_path / "sheet.png").stat().st_size > 0
+
+
+def test_write_outputs_surfaces_figure_errors(tmp_path, monkeypatch):
+    scs, top, scores = _synthetic_run_data()
+    cfg = cs.ScenarioConfig(
+        model_ckpt="x",
+        output_dir=str(tmp_path),
+        prompts=["prompt 0", "prompt 1"],
+        seeds=[0, 1],
+        top_n=4,
+        agg_k=4,
+        secondary_metric=None,
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("render failed")
+
+    monkeypatch.setattr(cs, "_save_scenario_channel_heatmap", boom)
+    monkeypatch.setattr(cs, "_save_stability_overlap", boom)
+    summary = cs._write_outputs(cfg, scs, top, scores, d=16)
+    assert set(summary["figure_errors"]) == {"scenario_channel_heatmap", "stability_overlap"}
+    assert "render failed" in summary["figure_errors"]["stability_overlap"]
+
+
+def test_dump_scenario_qualitative_dir_naming(tmp_path):
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("PIL")
+    rng = np.random.default_rng(3)
+    cfg = cs.ScenarioConfig(
+        model_ckpt="x",
+        output_dir=str(tmp_path),
+        prompts=["a"],
+        seeds=[7],
+        top_n=4,
+        agg_k=2,
+        n_channel_maps=1,
+        n_control_maps=1,
+    )
+    sc = cs.build_scenarios(cfg.prompts, cfg.seeds)[0]
+    stream = rng.normal(size=(16, 8))
+    rgb = rng.integers(0, 255, size=(8, 8, 3), dtype=np.uint8)
+    cs.dump_scenario_qualitative(
+        cfg,
+        sc,
+        stream,
+        rgb,
+        np.arange(4),
+        np.arange(4)[::-1].copy(),
+        rng.uniform(1, 10, size=8),
+        4,
+        4,
+    )
+    sdir = tmp_path / "scenarios" / "p0_s7"
+    assert (sdir / "image.png").is_file()
+    assert (sdir / "aggregated_top2.png").is_file()
+    assert any(f.name.startswith("control_rank") for f in sdir.iterdir())
+
+
+# --- new config keys ------------------------------------------------------------
+
+
+def test_config_capture_steps_and_secondary_metric(tmp_path):
+    cfg = cs.load_scenario_config(
+        _write_cfg(tmp_path, capture_steps=[0, 24, 49], secondary_metric="max")
+    )
+    assert cfg.capture_steps == [0, 24, 49]
+    assert cfg.secondary_metric == "max"
+
+    with pytest.raises(ValueError):
+        cs.load_scenario_config(_write_cfg(tmp_path, capture_steps=[0, 99]))  # out of range
+    with pytest.raises(ValueError):
+        cs.load_scenario_config(_write_cfg(tmp_path, capture_steps=[0, 1, 2, 3, 4]))  # too many
+    with pytest.raises(ValueError):
+        cs.load_scenario_config(_write_cfg(tmp_path, secondary_metric="median"))
+
+
 # --- CSV writers --------------------------------------------------------------
 
 

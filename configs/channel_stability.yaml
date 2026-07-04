@@ -20,6 +20,8 @@ offload: false       # true => enable_model_cpu_offload (fits the 12B model on <
 
 # --- fixed probe point (constant across scenarios) ----------------------------
 fixed_layer: 11      # paper reports this layer works best; a double-stream block (0..18)
+capture_steps: [0, 24, 49]   # extra denoising-step snapshots for the step-consistency
+                             # check (primary analysis stays last-step); null = last only
 
 # --- scenarios: cross-product of prompts × seeds ------------------------------
 # same prompt / different seed  -> generation-to-generation identity jitter
@@ -35,5 +37,7 @@ seeds: [0, 1, 2]
 top_n: 20            # ordered top-20 saved per scenario; top-1/5/10 are prefixes
 agg_k: 10            # channels combined into the aggregated heatmap
 n_channel_maps: 5    # per-channel spatial maps dumped for representative scenarios
-n_control_maps: 0    # optional low-ranked control maps (same count); 0 disables
-representative_scenarios:   # scenario_ids to dump qualitatively; blank => first 3 distinct prompts (seed 0)
+n_control_maps: 2    # low-ranked control maps for the same scenarios
+secondary_metric: p999      # token-localized complement to abs(mean): p999 | max | null
+representative_scenarios:   # scenario_ids to dump qualitatively; blank => prompt 0 at
+                            # every seed (seed jitter) + prompts 1-2 at seed 0 (content)
