@@ -436,6 +436,11 @@ def run(cfg: ScenarioConfig) -> dict[str, Any]:
     """Generate every scenario, rank channels, write tables + stability summary + dumps."""
     from src.common import model_utils
 
+    # Nest under a layer-specific subfolder so different `fixed_layer` runs (e.g. sweeping
+    # layers for the same model/prompts/seeds) don't overwrite each other's outputs.
+    cfg = replace(cfg, output_dir=os.path.join(cfg.output_dir, f"layer_{cfg.fixed_layer}"))
+    os.makedirs(cfg.output_dir, exist_ok=True)
+
     scenarios = build_scenarios(cfg.prompts, cfg.seeds)
     # Default representative scenarios: the first (up to) 3 DISTINCT prompts at their first
     # seed, so the qualitative dumps show different content (not one prompt at three seeds).
