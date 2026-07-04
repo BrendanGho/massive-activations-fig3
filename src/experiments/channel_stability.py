@@ -288,6 +288,61 @@ def _save_heatmap(path: str, arr: np.ndarray, title: str) -> None:
     plt.close(fig)
 
 
+def _save_scenario_channel_heatmap(
+    path: str,
+    scenarios: list[Scenario],
+    channels: list[int],
+    score_of: dict[int, dict[int, float]],
+    n_seeds: int,
+) -> None:
+    """Visual companion to ``scenario_channel_scores.csv``: rows=scenarios, cols=channels,
+    color=score, blank (masked) where a channel isn't in that scenario's top-n. Horizontal
+    lines group seeds belonging to the same prompt; channels are ordered by descending
+    selection frequency so the "usually-massive" channels cluster on the left.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy.ma as ma
+
+    freq = [sum(1 for sc in scenarios if c in score_of[sc.scenario_id]) for c in channels]
+    order = sorted(range(len(channels)), key=lambda i: -freq[i])
+    cols = [channels[i] for i in order]
+
+    mat = np.full((len(scenarios), len(cols)), np.nan)
+    for r, sc in enumerate(scenarios):
+        row = score_of[sc.scenario_id]
+        for c, ch in enumerate(cols):
+            if ch in row:
+                mat[r, c] = row[ch]
+    masked = ma.masked_invalid(mat)
+
+    fig_w = max(6.0, 0.28 * len(cols) + 2.0)
+    fig_h = max(4.0, 0.35 * len(scenarios) + 1.5)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    cmap = plt.get_cmap("magma").copy()
+    cmap.set_bad(color="0.9")
+    im = ax.imshow(masked, cmap=cmap, aspect="auto")
+
+    for r in range(1, len(scenarios)):
+        if scenarios[r].prompt_id != scenarios[r - 1].prompt_id:
+            ax.axhline(r - 0.5, color="white", linewidth=1.2)
+
+    ax.set_yticks(range(len(scenarios)))
+    ax.set_yticklabels([f"p{sc.prompt_id}/s{sc.seed}" for sc in scenarios], fontsize=7)
+    if len(cols) <= 60:
+        ax.set_xticks(range(len(cols)))
+        ax.set_xticklabels([str(c) for c in cols], fontsize=6, rotation=90)
+    else:
+        ax.set_xlabel("channel id (sorted by selection frequency, most-selected first)")
+    ax.set_title("scenario x channel score (blank = not in that scenario's top-n)", fontsize=10)
+    fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02, label="score")
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
 def _save_jaccard_heatmap(path: str, mat: np.ndarray, k: int) -> None:
     import matplotlib
 
@@ -486,7 +541,18 @@ def _write_outputs(
     summary = compute_stability_summary(scenarios, top_idx_by_scenario, d, len(cfg.seeds))
     io.save_json(os.path.join(out, "stability_summary.json"), summary)
 
-    # Optional Jaccard heatmap at top-10 (lazy matplotlib; skip if it can't be drawn).
+    # Figures alongside the CSVs above (best-effort; skip quietly if plotting fails).
+    try:
+        _save_scenario_channel_heatmap(
+            os.path.join(out, "scenario_channel_heatmap.png"),
+            scenarios,
+            channels,
+            score_of,
+            len(cfg.seeds),
+        )
+    except Exception as exc:  # pragma: no cover - plotting is best-effort
+        print(f"[channel_stability] skipped scenario x channel heatmap: {exc}")
+
     try:
         sids = [sc.scenario_id for sc in scenarios]
         sets = [np.asarray(top_idx_by_scenario[s]).ravel()[:10] for s in sids]
