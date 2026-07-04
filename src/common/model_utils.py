@@ -143,12 +143,19 @@ class CaptureState:
     n_text: int | None = None
     forward_count: int = 0
     image_streams: dict[int, np.ndarray] = field(default_factory=dict)
+    # Optional multi-timestep capture: denoising-step indices to snapshot. The last-step
+    # `image_streams` buffer is always kept regardless; `step_streams` is keyed by
+    # (step, layer_id). One transformer forward == one denoising step for FLUX
+    # (no CFG batch duplication), so the step index is `forward_count - 1`.
+    capture_steps: set[int] | None = None
+    step_streams: dict[tuple[int, int], np.ndarray] = field(default_factory=dict)
 
     def reset(self) -> None:
         self.n_image = None
         self.n_text = None
         self.forward_count = 0
         self.image_streams = {}
+        self.step_streams = {}  # capture_steps (the request) survives reset
 
 
 def _extract_image_stream(output: Any, n_image: int) -> np.ndarray | None:
@@ -214,6 +221,9 @@ def register_capture_hooks(transformer: Any, blocks: list[BlockRef], state: Capt
             stream = _extract_image_stream(output, state.n_image)
             if stream is not None:
                 state.image_streams[layer_id] = stream  # overwrite -> last step wins
+                step = state.forward_count - 1  # pre-hook already counted this forward
+                if state.capture_steps is not None and step in state.capture_steps:
+                    state.step_streams[(step, layer_id)] = stream
 
         return hook
 

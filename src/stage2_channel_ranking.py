@@ -48,6 +48,22 @@ def channel_scores(image_stream: np.ndarray) -> np.ndarray:
     return np.abs(mu)
 
 
+def channel_scores_max(image_stream: np.ndarray, q: float = 0.999) -> np.ndarray:
+    """Complementary token-localized score: quantile-over-tokens of ``abs(activation)``.
+
+    ``q=1.0`` is the per-channel abs max. This is NOT a replacement for
+    ``channel_scores`` (the fig3 mean-then-abs invariant); it exists to catch channels
+    that are massive at only a few tokens, which the mean dilutes.
+    image_stream: (N_tokens, D) -> (D,).
+    """
+    acts = np.asarray(image_stream, dtype=np.float64)
+    if acts.ndim != 2:
+        raise ValueError(f"image_stream must be 2D (N_tokens, D), got {acts.shape}")
+    if not 0.0 < q <= 1.0:
+        raise ValueError(f"q must be in (0, 1], got {q}")
+    return np.quantile(np.abs(acts), q, axis=0)
+
+
 def rank_channels(
     image_stream: np.ndarray,
     top_k: int,

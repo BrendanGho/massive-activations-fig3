@@ -58,8 +58,14 @@ class ScenarioConfig:
     n_control_maps: int = 0
     prompts: list[str] = field(default_factory=list)
     seeds: list[int] = field(default_factory=lambda: [0])
-    representative_scenarios: list[int] | None = None  # None -> first 3
+    representative_scenarios: list[int] | None = None  # None -> seed-jitter + content mix
     offload: bool = False
+    # Multi-timestep capture: denoising-step indices to snapshot in addition to the
+    # last step (primary analysis stays last-step). None -> last step only.
+    capture_steps: list[int] | None = None
+    # Complementary token-localized ranking metric: "p999" (abs 99.9th pct over tokens),
+    # "max" (abs max), or None to disable. Primary metric stays abs(mean_over_tokens).
+    secondary_metric: str | None = "p999"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -107,6 +113,21 @@ def _validate(cfg: ScenarioConfig, source: str) -> None:
         raise ValueError(f"agg_k must be in 1..top_n ({cfg.top_n}), got {cfg.agg_k}")
     if cfg.dtype not in ("bf16", "fp16", "fp32"):
         raise ValueError(f"dtype must be one of bf16/fp16/fp32, got {cfg.dtype!r}")
+    if cfg.capture_steps is not None:
+        if len(cfg.capture_steps) > 4:
+            raise ValueError(
+                f"capture_steps holds full activation snapshots in memory; at most 4 "
+                f"allowed, got {len(cfg.capture_steps)}"
+            )
+        bad = [s for s in cfg.capture_steps if not 0 <= int(s) < cfg.num_denoising_steps]
+        if bad:
+            raise ValueError(
+                f"capture_steps must be in 0..{cfg.num_denoising_steps - 1}, got {bad}"
+            )
+    if cfg.secondary_metric not in (None, "max", "p999"):
+        raise ValueError(
+            f"secondary_metric must be one of null/max/p999, got {cfg.secondary_metric!r}"
+        )
 
 
 # --- scenarios (pure) ---------------------------------------------------------
@@ -211,8 +232,74 @@ def compute_stability_summary(
                 float(np.mean(same_prompt)) if same_prompt else None
             ),
             "mean_jaccard_diff_prompt": float(np.mean(diff_prompt)) if diff_prompt else None,
+            # Raw pair values (12 same-prompt + 54 diff-prompt pairs for 4 prompts x 3
+            # seeds); the overlap figure plots these directly.
+            "pairs_same_prompt": [float(v) for v in same_prompt],
+            "pairs_diff_prompt": [float(v) for v in diff_prompt],
         }
     return summary
+
+
+def rank_channels_secondary(
+    stream: np.ndarray, metric: str, top_n: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """(top_idx, scores) under the token-localized secondary metric ("max" or "p999").
+
+    Same deterministic tie-breaking as ``rank_channels`` (stable sort, ascending id).
+    """
+    from src.stage2_channel_ranking import channel_scores_max
+
+    q = 1.0 if metric == "max" else 0.999
+    score = channel_scores_max(stream, q=q)
+    top_idx = np.argsort(-score, kind="stable")[:top_n].astype(np.int32)
+    return top_idx, score.astype(np.float32)
+
+
+def compute_step_consistency(
+    scenarios: list[Scenario],
+    top_idx_by_scenario: dict[int, np.ndarray],
+    step_top_by_scenario: dict[int, dict[int, np.ndarray]],
+) -> dict[str, Any]:
+    """Mean Jaccard(top-k at captured step vs top-k at the last step), per step and k.
+
+    Answers: is the last-step probe representative, or do the massive-channel
+    identities drift over denoising?
+    """
+    out: dict[str, Any] = {}
+    steps = sorted({s for per in step_top_by_scenario.values() for s in per})
+    for step in steps:
+        per_k: dict[str, float | None] = {}
+        for k in REPORT_KS:
+            vals = [
+                spatial.topk_jaccard(
+                    step_top_by_scenario[sc.scenario_id][step][:k],
+                    np.asarray(top_idx_by_scenario[sc.scenario_id]).ravel()[:k],
+                )
+                for sc in scenarios
+                if step in step_top_by_scenario.get(sc.scenario_id, {})
+            ]
+            per_k[str(k)] = float(np.mean(vals)) if vals else None
+        out[str(step)] = per_k
+    return out
+
+
+def compute_metric_agreement(
+    scenarios: list[Scenario],
+    top_idx_by_scenario: dict[int, np.ndarray],
+    secondary_top_by_scenario: dict[int, np.ndarray],
+) -> dict[str, float]:
+    """Mean per-scenario Jaccard(primary top-k, secondary top-k) for each k."""
+    out: dict[str, float] = {}
+    for k in REPORT_KS:
+        vals = [
+            spatial.topk_jaccard(
+                np.asarray(top_idx_by_scenario[sc.scenario_id]).ravel()[:k],
+                np.asarray(secondary_top_by_scenario[sc.scenario_id]).ravel()[:k],
+            )
+            for sc in scenarios
+        ]
+        out[str(k)] = float(np.mean(vals))
+    return out
 
 
 # --- CSV writers --------------------------------------------------------------
@@ -292,13 +379,16 @@ def _save_scenario_channel_heatmap(
     path: str,
     scenarios: list[Scenario],
     channels: list[int],
-    score_of: dict[int, dict[int, float]],
+    rank_of: dict[int, dict[int, int]],
+    top_n: int,
     n_seeds: int,
 ) -> None:
-    """Visual companion to ``scenario_channel_scores.csv``: rows=scenarios, cols=channels,
-    color=score, blank (masked) where a channel isn't in that scenario's top-n. Horizontal
-    lines group seeds belonging to the same prompt; channels are ordered by descending
-    selection frequency so the "usually-massive" channels cluster on the left.
+    """Visual companion to ``scenario_channel_matrix.csv``: rows=scenarios, cols=channels,
+    color = 1-based RANK within the scenario (rank 1 darkest), blank (grey) where a
+    channel isn't in that scenario's top-n. Rank, not raw score, so color is comparable
+    across scenarios (scores live in ``scenario_channel_scores.csv``). Columns are
+    ordered by descending selection frequency (mean-rank tie-break); a vertical line
+    separates channels selected in every scenario from the rest.
     """
     import matplotlib
 
@@ -306,28 +396,51 @@ def _save_scenario_channel_heatmap(
     import matplotlib.pyplot as plt
     import numpy.ma as ma
 
-    freq = [sum(1 for sc in scenarios if c in score_of[sc.scenario_id]) for c in channels]
-    order = sorted(range(len(channels)), key=lambda i: -freq[i])
-    cols = [channels[i] for i in order]
+    def freq_of(c: int) -> int:
+        return sum(1 for sc in scenarios if c in rank_of[sc.scenario_id])
+
+    def mean_rank_of(c: int) -> float:
+        ranks = [rank_of[sc.scenario_id][c] for sc in scenarios if c in rank_of[sc.scenario_id]]
+        return float(np.mean(ranks)) if ranks else float("inf")
+
+    cols = sorted(channels, key=lambda c: (-freq_of(c), mean_rank_of(c), c))
+    n_always = sum(1 for c in cols if freq_of(c) == len(scenarios))
 
     mat = np.full((len(scenarios), len(cols)), np.nan)
     for r, sc in enumerate(scenarios):
-        row = score_of[sc.scenario_id]
+        row = rank_of[sc.scenario_id]
         for c, ch in enumerate(cols):
             if ch in row:
                 mat[r, c] = row[ch]
     masked = ma.masked_invalid(mat)
 
-    fig_w = max(6.0, 0.28 * len(cols) + 2.0)
-    fig_h = max(4.0, 0.35 * len(scenarios) + 1.5)
+    fig_w = max(6.0, 0.3 * len(cols) + 2.0)
+    fig_h = max(4.0, 0.4 * len(scenarios) + 1.5)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-    cmap = plt.get_cmap("magma").copy()
-    cmap.set_bad(color="0.9")
-    im = ax.imshow(masked, cmap=cmap, aspect="auto")
+    cmap = plt.get_cmap("magma").copy()  # low (rank 1) = dark = most salient
+    cmap.set_bad(color="0.92")
+    im = ax.imshow(masked, cmap=cmap, aspect="auto", vmin=1, vmax=top_n)
 
     for r in range(1, len(scenarios)):
         if scenarios[r].prompt_id != scenarios[r - 1].prompt_id:
-            ax.axhline(r - 0.5, color="white", linewidth=1.2)
+            ax.axhline(r - 0.5, color="white", linewidth=1.5)
+    if 0 < n_always < len(cols):
+        ax.axvline(n_always - 0.5, color="white", linewidth=1.5, linestyle="--")
+
+    if len(cols) <= 40:
+        for r in range(len(scenarios)):
+            for c in range(len(cols)):
+                if not np.isnan(mat[r, c]):
+                    rank = int(mat[r, c])
+                    ax.text(
+                        c,
+                        r,
+                        str(rank),
+                        ha="center",
+                        va="center",
+                        fontsize=6,
+                        color="white" if rank <= top_n // 2 else "black",
+                    )
 
     ax.set_yticks(range(len(scenarios)))
     ax.set_yticklabels([f"p{sc.prompt_id}/s{sc.seed}" for sc in scenarios], fontsize=7)
@@ -336,27 +449,180 @@ def _save_scenario_channel_heatmap(
         ax.set_xticklabels([str(c) for c in cols], fontsize=6, rotation=90)
     else:
         ax.set_xlabel("channel id (sorted by selection frequency, most-selected first)")
-    ax.set_title("scenario x channel score (blank = not in that scenario's top-n)", fontsize=10)
-    fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02, label="score")
+    ax.set_title(
+        f"scenario x channel rank (1 = largest; grey = not in top-{top_n}; "
+        "left of dashed line = selected in every scenario)",
+        fontsize=9,
+    )
+    fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02, label="rank in scenario")
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt.close(fig)
 
 
-def _save_jaccard_heatmap(path: str, mat: np.ndarray, k: int) -> None:
+def _save_stability_overlap(
+    path: str,
+    mat: np.ndarray,
+    k: int,
+    scenarios: list[Scenario],
+    n_seeds: int,
+    summary: dict[str, Any],
+) -> None:
+    """Two-panel headline figure.
+
+    Left: block-structured pairwise top-k Jaccard matrix — thick dividers every
+    ``n_seeds`` rows/cols so same-prompt (diagonal) blocks vs cross-prompt blocks are
+    visible at a glance. Right: same-prompt/diff-seed vs diff-prompt mean Jaccard over
+    k, with every individual pair shown as a jittered dot; the vertical gap between the
+    two series is the experiment's finding (content dependence vs seed jitter).
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(mat, cmap="viridis", vmin=0.0, vmax=1.0)
-    ax.set_title(f"pairwise top-{k} channel-identity Jaccard", fontsize=10)
-    ax.set_xlabel("scenario_id")
-    ax.set_ylabel("scenario_id")
-    fig.colorbar(im, ax=ax, fraction=0.046)
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11, 4.5), width_ratios=[1.1, 1])
+
+    im = ax0.imshow(mat, cmap="viridis", vmin=0.0, vmax=1.0)
+    labels = [f"p{sc.prompt_id}/s{sc.seed}" for sc in scenarios]
+    ax0.set_xticks(range(len(labels)))
+    ax0.set_xticklabels(labels, fontsize=6, rotation=90)
+    ax0.set_yticks(range(len(labels)))
+    ax0.set_yticklabels(labels, fontsize=6)
+    for pos in range(n_seeds, len(scenarios), n_seeds):
+        ax0.axhline(pos - 0.5, color="white", linewidth=2.0)
+        ax0.axvline(pos - 0.5, color="white", linewidth=2.0)
+    ax0.set_title(
+        f"pairwise top-{k} Jaccard\n(diagonal blocks = same prompt, different seed)",
+        fontsize=9,
+    )
+    fig.colorbar(im, ax=ax0, fraction=0.046)
+
+    ks = [int(k_) for k_ in summary["per_k"]]
+    rng = np.random.default_rng(0)
+    for key, color, label in (
+        ("pairs_same_prompt", "#1b7837", "same prompt, diff seed"),
+        ("pairs_diff_prompt", "#762a83", "different prompt"),
+    ):
+        means = []
+        for i, k_ in enumerate(ks):
+            pairs = summary["per_k"][str(k_)].get(key, [])
+            if pairs:
+                x = i + rng.uniform(-0.12, 0.12, size=len(pairs))
+                ax1.scatter(x, pairs, s=12, color=color, alpha=0.35, linewidths=0)
+            means.append(float(np.mean(pairs)) if pairs else np.nan)
+        ax1.plot(range(len(ks)), means, "o-", color=color, label=label, markersize=6)
+    ax1.set_xticks(range(len(ks)))
+    ax1.set_xticklabels([f"top-{k_}" for k_ in ks])
+    ax1.set_ylim(-0.05, 1.05)
+    ax1.set_ylabel("channel-identity Jaccard")
+    ax1.set_title("seed jitter vs content dependence", fontsize=9)
+    ax1.legend(fontsize=8, loc="best")
+    ax1.grid(axis="y", color="0.9", linewidth=0.7)
+    ax1.set_axisbelow(True)
+
     fig.tight_layout()
-    fig.savefig(path, dpi=120)
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+def _save_step_consistency(path: str, per_step_jaccard: dict[str, Any], n_steps: int) -> None:
+    """Mean Jaccard(top-k at captured step vs last step) — one line per captured step."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(5, 3.5))
+    steps = sorted(per_step_jaccard, key=int)
+    cmap = plt.get_cmap("viridis")
+    for i, step in enumerate(steps):
+        per_k = per_step_jaccard[step]
+        ks = sorted(per_k, key=int)
+        vals = [per_k[k_] for k_ in ks]
+        color = cmap(0.15 + 0.7 * (int(step) / max(1, n_steps - 1)))
+        ax.plot(
+            range(len(ks)),
+            vals,
+            "o-",
+            color=color,
+            markersize=5,
+            label=f"step {step} vs last",
+        )
+    ax.set_xticks(range(len(ks)))
+    ax.set_xticklabels([f"top-{k_}" for k_ in ks])
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_ylabel("mean Jaccard vs last step")
+    ax.set_title("top-channel identity across denoising steps", fontsize=9)
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", color="0.9", linewidth=0.7)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+def _save_contact_sheet(
+    path: str,
+    rows: list[dict[str, Any]],
+    agg_k: int,
+    h_lat: int,
+    w_lat: int,
+    n_top_panels: int = 3,
+) -> None:
+    """One qualitative summary figure: one row per representative scenario —
+    [generated image | top-1..n channel maps | aggregated top-k | low-rank control].
+
+    ``rows``: dicts with keys sc (Scenario), rgb (H,W,3 uint8), stream (N,D),
+    top_idx, bottom_idx, scores.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n_cols = 1 + n_top_panels + 1 + 1  # image + top maps + aggregate + control
+    fig, axes = plt.subplots(
+        len(rows), n_cols, figsize=(2.3 * n_cols, 2.5 * len(rows)), squeeze=False
+    )
+    for r, row in enumerate(rows):
+        sc, stream, scores = row["sc"], row["stream"], row["scores"]
+        panels = axes[r]
+
+        panels[0].imshow(row["rgb"])
+        panels[0].set_title(
+            f'"{sc.prompt[:38]}…"' if len(sc.prompt) > 38 else f'"{sc.prompt}"', fontsize=6
+        )
+        panels[0].set_ylabel(f"p{sc.prompt_id}/s{sc.seed}", fontsize=9)
+        panels[0].set_xticks([])
+        panels[0].set_yticks([])
+
+        for i in range(n_top_panels):
+            ax = panels[1 + i]
+            ch = int(row["top_idx"][i])
+            smap = spatial.channel_spatial_map(stream, ch, h_lat, w_lat, normalize=True)
+            ax.imshow(smap, cmap="magma")
+            ax.set_title(f"rank {i + 1} · ch {ch}\nscore {scores[ch]:.3g}", fontsize=7)
+            ax.axis("off")
+
+        agg = spatial.aggregated_topk_heatmap(stream, row["top_idx"][:agg_k], h_lat, w_lat)
+        panels[1 + n_top_panels].imshow(agg, cmap="magma")
+        panels[1 + n_top_panels].set_title(f"aggregated top-{agg_k}", fontsize=7)
+        panels[1 + n_top_panels].axis("off")
+
+        ax = panels[-1]
+        ch = int(row["bottom_idx"][0])
+        smap = spatial.channel_spatial_map(stream, ch, h_lat, w_lat, normalize=True)
+        ax.imshow(smap, cmap="magma")
+        ax.set_title(f"control (low rank)\nch {ch} · score {scores[ch]:.3g}", fontsize=7)
+        ax.axis("off")
+
+    fig.suptitle(
+        "generated image · top-channel spatial maps · aggregate · low-rank control",
+        fontsize=10,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(path, dpi=130)
     plt.close(fig)
 
 
@@ -372,7 +638,7 @@ def dump_scenario_qualitative(
     w_lat: int,
 ) -> None:
     """Image + per-channel spatial maps + aggregated top-k heatmap (+ optional controls)."""
-    sdir = os.path.join(cfg.output_dir, "scenarios", f"scenario_{sc.scenario_id:03d}")
+    sdir = os.path.join(cfg.output_dir, "scenarios", f"p{sc.prompt_id}_s{sc.seed}")
     os.makedirs(sdir, exist_ok=True)
 
     _save_image(os.path.join(sdir, "image.png"), rgb)
@@ -416,9 +682,20 @@ def write_run_metadata(
         "n_scenarios": len(scenarios),
         "assumptions": {
             "score": "abs(mean_over_tokens) — mean then abs (fig3 massive-activation score)",
+            "secondary_score": (
+                f"{cfg.secondary_metric}: quantile-over-tokens of abs(activation) "
+                "(token-localized complement)"
+                if cfg.secondary_metric
+                else None
+            ),
             "probe": {
                 "fixed_layer": cfg.fixed_layer,
-                "timestep": "last denoising step only (hook overwrite -> last forward wins)",
+                "timestep": (
+                    "primary analysis = last denoising step; additionally snapshotting "
+                    f"steps {cfg.capture_steps} for step-consistency check"
+                    if cfg.capture_steps
+                    else "last denoising step only (hook overwrite -> last forward wins)"
+                ),
                 "stream": "image-stream tokens only; N_I derived at runtime",
             },
         },
@@ -442,25 +719,33 @@ def run(cfg: ScenarioConfig) -> dict[str, Any]:
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     scenarios = build_scenarios(cfg.prompts, cfg.seeds)
-    # Default representative scenarios: the first (up to) 3 DISTINCT prompts at their first
-    # seed, so the qualitative dumps show different content (not one prompt at three seeds).
+    # Default representative scenarios cover BOTH axes of the design: prompt 0 at every
+    # seed (seed-to-seed jitter) plus prompts 1 and 2 at their first seed (content
+    # dependence).
     n_seeds = len(cfg.seeds)
-    rep = (
-        set(cfg.representative_scenarios)
-        if cfg.representative_scenarios is not None
-        else {p * n_seeds for p in range(min(3, len(cfg.prompts)))}
-    )
+    if cfg.representative_scenarios is not None:
+        rep = set(cfg.representative_scenarios)
+    else:
+        rep = set(range(n_seeds))  # prompt 0, all seeds
+        rep |= {p * n_seeds for p in (1, 2) if p < len(cfg.prompts)}
     write_run_metadata(cfg, scenarios, model_info=None)
 
     pipe = model_utils.load_pipeline(cfg, offload=cfg.offload)
     transformer = pipe.transformer
     all_blocks = model_utils.discover_blocks(transformer)
     blocks = model_utils.select_layers(all_blocks, [cfg.fixed_layer])
-    state = model_utils.CaptureState()
+    state = model_utils.CaptureState(
+        capture_steps=set(int(s) for s in cfg.capture_steps) if cfg.capture_steps else None
+    )
     handles = model_utils.register_capture_hooks(transformer, blocks, state)
 
     top_idx_by_scenario: dict[int, np.ndarray] = {}
     scores_by_scenario: dict[int, np.ndarray] = {}
+    secondary_top_by_scenario: dict[int, np.ndarray] = {}
+    secondary_scores_by_scenario: dict[int, np.ndarray] = {}
+    step_top_by_scenario: dict[int, dict[int, np.ndarray]] = {}
+    contact_rows: list[dict[str, Any]] = []
+    h_lat = w_lat = None
     d = None
     model_info_written = False
 
@@ -481,12 +766,33 @@ def run(cfg: ScenarioConfig) -> dict[str, Any]:
                 stream,
                 top_k=cfg.top_n,
                 random_k_trials=0,
-                seed=cfg.seed,
-                prompt_id=sc.scenario_id,
+                seed=sc.seed,
+                prompt_id=sc.prompt_id,
                 layer=cfg.fixed_layer,
             )
             top_idx_by_scenario[sc.scenario_id] = rank.top_idx
             scores_by_scenario[sc.scenario_id] = rank.scores
+
+            if cfg.secondary_metric:
+                sec_idx, sec_scores = rank_channels_secondary(
+                    stream, cfg.secondary_metric, cfg.top_n
+                )
+                secondary_top_by_scenario[sc.scenario_id] = sec_idx
+                secondary_scores_by_scenario[sc.scenario_id] = sec_scores
+
+            if cfg.capture_steps:
+                from src.stage2_channel_ranking import channel_scores
+
+                per_step: dict[int, np.ndarray] = {}
+                for step in cfg.capture_steps:
+                    st = state.step_streams.get((int(step), cfg.fixed_layer))
+                    if st is None:
+                        continue
+                    sc_scores = channel_scores(st)
+                    per_step[int(step)] = np.argsort(-sc_scores, kind="stable")[: cfg.top_n].astype(
+                        np.int32
+                    )
+                step_top_by_scenario[sc.scenario_id] = per_step
 
             if not model_info_written:
                 write_run_metadata(
@@ -507,11 +813,32 @@ def run(cfg: ScenarioConfig) -> dict[str, Any]:
                 dump_scenario_qualitative(
                     cfg, sc, stream, rgb, rank.top_idx, rank.bottom_idx, rank.scores, h_lat, w_lat
                 )
+                contact_rows.append(
+                    {
+                        "sc": sc,
+                        "rgb": rgb,
+                        "stream": stream,
+                        "top_idx": rank.top_idx,
+                        "bottom_idx": rank.bottom_idx,
+                        "scores": rank.scores,
+                    }
+                )
     finally:
         for h in handles:
             h.remove()
 
-    return _write_outputs(cfg, scenarios, top_idx_by_scenario, scores_by_scenario, int(d))
+    return _write_outputs(
+        cfg,
+        scenarios,
+        top_idx_by_scenario,
+        scores_by_scenario,
+        int(d),
+        secondary_top_by_scenario=secondary_top_by_scenario or None,
+        secondary_scores_by_scenario=secondary_scores_by_scenario or None,
+        step_top_by_scenario=step_top_by_scenario or None,
+        contact_rows=contact_rows or None,
+        latent_grid=(h_lat, w_lat) if h_lat is not None else None,
+    )
 
 
 def _write_outputs(
@@ -520,6 +847,11 @@ def _write_outputs(
     top_idx_by_scenario: dict[int, np.ndarray],
     scores_by_scenario: dict[int, np.ndarray],
     d: int,
+    secondary_top_by_scenario: dict[int, np.ndarray] | None = None,
+    secondary_scores_by_scenario: dict[int, np.ndarray] | None = None,
+    step_top_by_scenario: dict[int, dict[int, np.ndarray]] | None = None,
+    contact_rows: list[dict[str, Any]] | None = None,
+    latent_grid: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     out = cfg.output_dir
     write_topk_csv(
@@ -544,28 +876,96 @@ def _write_outputs(
     )
 
     summary = compute_stability_summary(scenarios, top_idx_by_scenario, d, len(cfg.seeds))
+
+    if secondary_top_by_scenario and secondary_scores_by_scenario:
+        write_topk_csv(
+            os.path.join(out, f"channel_stability_topk_{cfg.secondary_metric}.csv"),
+            scenarios,
+            secondary_top_by_scenario,
+            secondary_scores_by_scenario,
+        )
+        summary["secondary_metric"] = {
+            "name": cfg.secondary_metric,
+            "mean_jaccard_primary_vs_secondary_per_k": compute_metric_agreement(
+                scenarios, top_idx_by_scenario, secondary_top_by_scenario
+            ),
+            "stability": compute_stability_summary(
+                scenarios, secondary_top_by_scenario, d, len(cfg.seeds)
+            ),
+        }
+
+    if step_top_by_scenario:
+        summary["per_step_jaccard"] = compute_step_consistency(
+            scenarios, top_idx_by_scenario, step_top_by_scenario
+        )
+
     io.save_json(os.path.join(out, "stability_summary.json"), summary)
 
-    # Figures alongside the CSVs above (best-effort; skip quietly if plotting fails).
-    try:
-        _save_scenario_channel_heatmap(
+    # Figures alongside the CSVs above. Failures never abort the run, but they are
+    # reported loudly (full traceback) and surfaced in summary["figure_errors"].
+    figure_errors: dict[str, str] = {}
+
+    def _try_fig(name: str, fn) -> None:
+        import traceback
+
+        try:
+            fn()
+        except Exception:
+            tb = traceback.format_exc()
+            print(f"[channel_stability] FAILED to render {name}:\n{tb}")
+            figure_errors[name] = tb
+
+    _try_fig(
+        "scenario_channel_heatmap",
+        lambda: _save_scenario_channel_heatmap(
             os.path.join(out, "scenario_channel_heatmap.png"),
             scenarios,
             channels,
-            score_of,
+            rank_of,
+            cfg.top_n,
             len(cfg.seeds),
-        )
-    except Exception as exc:  # pragma: no cover - plotting is best-effort
-        print(f"[channel_stability] skipped scenario x channel heatmap: {exc}")
+        ),
+    )
 
-    try:
+    def _overlap() -> None:
         sids = [sc.scenario_id for sc in scenarios]
-        sets = [np.asarray(top_idx_by_scenario[s]).ravel()[:10] for s in sids]
-        _save_jaccard_heatmap(
-            os.path.join(out, "stability_overlap.png"), spatial.pairwise_jaccard_matrix(sets), 10
+        sets = [np.asarray(top_idx_by_scenario[s]).ravel()[: cfg.agg_k] for s in sids]
+        _save_stability_overlap(
+            os.path.join(out, "stability_overlap.png"),
+            spatial.pairwise_jaccard_matrix(sets),
+            cfg.agg_k,
+            scenarios,
+            len(cfg.seeds),
+            summary,
         )
-    except Exception as exc:  # pragma: no cover - plotting is best-effort
-        print(f"[channel_stability] skipped overlap heatmap: {exc}")
+
+    _try_fig("stability_overlap", _overlap)
+
+    if step_top_by_scenario and summary.get("per_step_jaccard"):
+        _try_fig(
+            "step_consistency",
+            lambda: _save_step_consistency(
+                os.path.join(out, "step_consistency.png"),
+                summary["per_step_jaccard"],
+                cfg.num_denoising_steps,
+            ),
+        )
+
+    if contact_rows and latent_grid is not None:
+        _try_fig(
+            "qualitative_summary",
+            lambda: _save_contact_sheet(
+                os.path.join(out, "qualitative_summary.png"),
+                contact_rows,
+                cfg.agg_k,
+                latent_grid[0],
+                latent_grid[1],
+            ),
+        )
+
+    summary["figure_errors"] = figure_errors
+    if figure_errors:
+        io.save_json(os.path.join(out, "stability_summary.json"), summary)
 
     print(
         f"[channel_stability] {len(scenarios)} scenarios, {len(channels)} distinct top-{cfg.top_n} "
