@@ -127,6 +127,53 @@ bottom-k flat ≈ 0.2, random-k between, FLUX.2-klein top-k peak ≈ 0.5 near la
 If the shape is off, the likely culprits are the normalization order or the mean-then-abs
 ranking.
 
+## Part 2 — per-generation channel stability (the main experiment)
+
+`src/experiments/channel_stability.py` + `configs/channel_stability.yaml` (driven by the
+Part 2 cells of `Figure3_Colab.ipynb`). Question: *for each individual generation
+(prompt + seed), which channels are largest, and do their identities change with what
+the model generates?*
+
+**Design.** One fixed transformer block (`fixed_layer: 11`), image-stream tokens only,
+primary analysis at the last denoising step. Scenarios are the cross-product of
+4 prompts × 3 seeds = 12 generations; channels are ranked **independently per scenario**.
+The prompt/seed grid is deliberate — it separates the two comparisons the experiment
+exists to make:
+
+- **same prompt, different seed** → generation-to-generation identity jitter
+- **different prompt** → content dependence of the top channels
+
+`stability_summary.json` reports mean top-k Jaccard for each split (k ∈ {1, 5, 10, 20}),
+and `stability_overlap.png` shows the block-structured pairwise matrix (diagonal blocks =
+same prompt) beside a same-prompt vs diff-prompt pair plot.
+
+**Scores.** Primary = `abs(mean_over_tokens)` (the fig3 massive-activation score;
+invariant #2 above). Secondary (`secondary_metric: p999`) = 99.9th percentile of
+`abs(activation)` over tokens — a token-localized complement that catches channels
+massive at only a few tokens, which the mean dilutes. The summary reports per-k
+agreement between the two rankings. Part 2 is **channel-space only**; there is no
+high-norm *token* analysis here.
+
+**Timesteps.** `capture_steps: [0, 24, 49]` additionally snapshots early/mid/last steps;
+`step_consistency.png` reports how much top-channel identity drifts across denoising
+(a check that the last-step probe is representative). Costs memory only, no extra GPU time.
+
+**Outputs** (under `output_dir/layer_{fixed_layer}/`):
+
+- `channel_stability_topk.csv` (+ `..._p999.csv`) — ordered top-20 per scenario;
+  top-1/5/10 are prefixes.
+- `scenario_channel_matrix.csv` / `scenario_channel_scores.csv` — wide scenario × channel
+  tables (rank / score).
+- `scenario_channel_heatmap.png` — scenario × channel colored by **rank** (comparable
+  across scenarios), always-selected channels left of the dashed divider.
+- `stability_overlap.png`, `step_consistency.png` — see above.
+- `qualitative_summary.png` — contact sheet: one row per representative scenario
+  (prompt 0 at all seeds for seed jitter + prompts 1–2 for content): generated image,
+  top-1..3 channel spatial maps, aggregated top-k heatmap, low-rank control map.
+- `scenarios/p{pid}_s{seed}/` — the per-scenario loose PNGs behind the contact sheet.
+- `stability_summary.json` — all numbers above plus `figure_errors` (any figure that
+  failed to render, with traceback).
+
 ## Colab storage
 
 Point both dirs at a Drive mount so writes survive a session ending mid-run (no code change):
