@@ -562,6 +562,16 @@ def _save_step_consistency(path: str, per_step_jaccard: dict[str, Any], n_steps:
     plt.close(fig)
 
 
+def _aggregate_sweep_ks(agg_k: int, n_ranked: int) -> list[int]:
+    """k values for the contact-sheet aggregate sweep: always top-5 and top-20 plus the
+    configured ``agg_k``, deduped, sorted, and clamped to the channels available. Falls
+    back to a single ``[n_ranked]`` panel when fewer than 5 channels were ranked."""
+    ks = sorted({k for k in (5, agg_k, 20) if 0 < k <= n_ranked})
+    if not ks:
+        return [n_ranked] if n_ranked else []
+    return ks
+
+
 def _save_contact_sheet(
     path: str,
     rows: list[dict[str, Any]],
@@ -571,7 +581,11 @@ def _save_contact_sheet(
     n_top_panels: int = 3,
 ) -> None:
     """One qualitative summary figure: one row per representative scenario —
-    [generated image | top-1..n channel maps | aggregated top-k | low-rank control].
+    [generated image | top-1..n channel maps | aggregated top-{5,agg_k,20} | low-rank control].
+
+    The aggregate is shown as a top-5 / top-agg_k / top-20 sweep (deduped) so the mask can
+    be read tightening or diluting as channels are added — the spatial counterpart to the
+    top-k Jaccard sweep in ``stability_overlap.png``.
 
     ``rows``: dicts with keys sc (Scenario), rgb (H,W,3 uint8), stream (N,D),
     top_idx, bottom_idx, scores.
@@ -581,7 +595,11 @@ def _save_contact_sheet(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    n_cols = 1 + n_top_panels + 1 + 1  # image + top maps + aggregate + control
+    # Aggregate sweep: always include top-5 and top-20 plus the configured agg_k.
+    n_ranked = len(rows[0]["top_idx"]) if rows else 0
+    agg_ks = _aggregate_sweep_ks(agg_k, n_ranked)
+
+    n_cols = 1 + n_top_panels + len(agg_ks) + 1  # image + top maps + aggregate sweep + control
     fig, axes = plt.subplots(
         len(rows), n_cols, figsize=(2.3 * n_cols, 2.5 * len(rows)), squeeze=False
     )
@@ -605,10 +623,12 @@ def _save_contact_sheet(
             ax.set_title(f"rank {i + 1} · ch {ch}\nscore {scores[ch]:.3g}", fontsize=7)
             ax.axis("off")
 
-        agg = spatial.aggregated_topk_heatmap(stream, row["top_idx"][:agg_k], h_lat, w_lat)
-        panels[1 + n_top_panels].imshow(agg, cmap="magma")
-        panels[1 + n_top_panels].set_title(f"aggregated top-{agg_k}", fontsize=7)
-        panels[1 + n_top_panels].axis("off")
+        for j, k in enumerate(agg_ks):
+            ax = panels[1 + n_top_panels + j]
+            agg = spatial.aggregated_topk_heatmap(stream, row["top_idx"][:k], h_lat, w_lat)
+            ax.imshow(agg, cmap="magma")
+            ax.set_title(f"aggregated top-{k}", fontsize=7)
+            ax.axis("off")
 
         ax = panels[-1]
         ch = int(row["bottom_idx"][0])
@@ -618,7 +638,7 @@ def _save_contact_sheet(
         ax.axis("off")
 
     fig.suptitle(
-        "generated image · top-channel spatial maps · aggregate · low-rank control",
+        "generated image · top-channel spatial maps · aggregate sweep (top-5..20) · low-rank control",
         fontsize=10,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.97))
