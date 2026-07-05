@@ -169,7 +169,9 @@ high-norm *token* analysis here.
 - `stability_overlap.png`, `step_consistency.png` — see above.
 - `qualitative_summary.png` — contact sheet: one row per representative scenario
   (prompt 0 at all seeds for seed jitter + prompts 1–2 for content): generated image,
-  top-1..3 channel spatial maps, aggregated top-k heatmap, low-rank control map.
+  top-1..3 channel spatial maps, a **top-5 / `agg_k` / top-20 aggregate sweep** (deduped;
+  the spatial counterpart to the top-k Jaccard sweep in `stability_overlap.png`, showing
+  the subject mask tighten or dilute as channels are added), low-rank control map.
 - `scenarios/p{pid}_s{seed}/` — the per-scenario loose PNGs behind the contact sheet.
 - `stability_summary.json` — all numbers above plus `figure_errors` (any figure that
   failed to render, with traceback).
