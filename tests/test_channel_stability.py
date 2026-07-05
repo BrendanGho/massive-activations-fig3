@@ -291,6 +291,21 @@ def test_contact_sheet_renders(tmp_path):
     assert (tmp_path / "sheet.png").stat().st_size > 0
 
 
+def test_aggregate_sweep_ks_always_spans_5_to_20_and_dedupes():
+    # Default agg_k=10 with a full top-20 ranking -> [5, 10, 20].
+    assert cs._aggregate_sweep_ks(10, 20) == [5, 10, 20]
+    # agg_k coincides with a sweep endpoint -> no duplicate.
+    assert cs._aggregate_sweep_ks(5, 20) == [5, 20]
+    assert cs._aggregate_sweep_ks(20, 20) == [5, 20]
+    # Fewer ranked channels than 20 clamps the top of the sweep.
+    assert cs._aggregate_sweep_ks(3, 8) == [3, 5]
+    # A sub-5 agg_k is still honored when it fits.
+    assert cs._aggregate_sweep_ks(3, 4) == [3]
+    # Fewer than 5 ranked channels and agg_k out of range falls back to a single panel.
+    assert cs._aggregate_sweep_ks(10, 4) == [4]
+    assert cs._aggregate_sweep_ks(10, 0) == []
+
+
 def test_write_outputs_surfaces_figure_errors(tmp_path, monkeypatch):
     scs, top, scores = _synthetic_run_data()
     cfg = cs.ScenarioConfig(
