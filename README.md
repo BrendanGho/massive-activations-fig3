@@ -176,6 +176,57 @@ high-norm *token* analysis here.
 - `stability_summary.json` — all numbers above plus `figure_errors` (any figure that
   failed to render, with traceback).
 
+## Part 3 — are the sparse outlier tokens the same as ViT "high-norm" tokens?
+
+`src/experiments/highnorm_tokens.py` + `configs/highnorm_tokens.yaml`, numeric core in
+`src/common/highnorm.py`, spec in [`SPEC_highnorm.md`](SPEC_highnorm.md). Question:
+isolating the top 1–2 massive channels at layer 18 renders a near-black image with sparse
+bright speckles — are those speckle tokens the **high-norm / register tokens** of
+Darcet et al. ([arXiv:2309.16588](https://arxiv.org/abs/2309.16588))? Where Part 2 is
+channel-space only, this is a **token-space** question.
+
+**The confound the design exists to control.** `‖x‖² = Σ_d x[d]²`, so a token with a massive
+value in one channel is high-norm *by construction*. Correlating the massive-channel score
+against the full token norm is circular and always returns overlap ≈ 1. Every statistic is
+therefore computed against `N_ex` — the norm with the massive channels **excised**. The
+confounded number is still reported, but only to show the size of the artifact.
+
+**Verdict rests on two effect sizes**, not on set overlap:
+
+- `selectivity` = median `m`[outlier] / median `m`[typical] — is the channel token-sparse,
+  i.e. are there speckles at all?
+- `elevation` = median `N_ex`[outlier] / median `N_ex`[typical] — do those tokens stay
+  high-norm once the massive channels are removed? *This is the question, numerically.*
+
+→ **H1** (selectivity ≫ 1, elevation ≈ 1): same phenomenon; massive activations *are* how
+these tokens get their norm. **H2** (both ≫ 1): genuine register tokens, broadly elevated.
+**H3** (selectivity ≈ 1): channel is uniformly large, no speckles to explain.
+
+Two seemingly natural measurements are unusable and the tests pin this down: `ρ` (share of
+squared norm owned by the massive channels) **cannot separate H1 from H3** — both give ≈ 1 —
+and an *"IoU beats the scale-matched null"* test **cannot detect H2**, because when tokens
+are broadly elevated any random channel reproduces the overlap. IoU/AUROC and both nulls are
+computed and plotted, but do not drive the verdict.
+
+**Outputs** (under `output_dir/`): `summary.json` (verdict + reading + all medians +
+logged deviations), `per_prompt.csv`, and `fig_variance_explained.png` (E1 ρ-vs-k curve),
+`fig_overlap.png` (E2, deconfounded vs both nulls vs the confounded artifact),
+`fig_norm_profile.png` (norm + bimodality across depth, Darcet Fig. 4a analogue),
+`fig_norm_hist.png` (final-layer histogram with the derived cutoff),
+`fig_spatial_panels.png` (rgb / `m` / `N_full` / `N_ex` side by side),
+`fig_position_stability.png` (do speckles sit at fixed grid slots across prompts?).
+
+**Note on the high-norm threshold.** Darcet's 150 is DINOv2-specific and stated to vary by
+model, so it is derived per run by 2-means on log-norms. Whether a two-mode reading is even
+warranted is checked independently with Sarle's bimodality coefficient (≈ 1/3 = unimodal,
+> 5/9 = bimodal) — deliberately not a 2-means split-quality metric, which scores ~0.64 on a
+plain Gaussian *and* on a heavy-tailed lognormal and so cannot tell a separated high-norm
+mode from a mere long tail.
+
+```bash
+python -m src.experiments.highnorm_tokens --config configs/highnorm_tokens.yaml
+```
+
 ## Colab storage
 
 Point both dirs at a Drive mount so writes survive a session ending mid-run (no code change):

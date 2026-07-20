@@ -1,0 +1,49 @@
+# Are massive-activation outlier tokens the same tokens as ViT "high-norm" tokens?
+#
+# Loaded by src/experiments/highnorm_tokens.py. See SPEC_highnorm.md for the question,
+# the confound being controlled, and the H1/H2/H3 decision rule.
+#
+#   python -m src.experiments.highnorm_tokens --config configs/highnorm_tokens.yaml
+
+# --- required -----------------------------------------------------------------
+model_ckpt: black-forest-labs/FLUX.1-schnell   # ungated, 4-step schedule
+output_dir:                                    # where CSV / summary.json / figures land
+
+# --- generation ---------------------------------------------------------------
+resolution: 1024
+num_denoising_steps: 4      # schnell few-step schedule
+guidance_scale:             # blank => pipeline default (schnell is distilled, no CFG)
+dtype: bf16                 # bf16 | fp16 | fp32  (T4 -> fp16)
+device: cuda
+offload: false              # true => enable_model_cpu_offload for <24GB GPUs
+seed: 0
+
+# --- probe point --------------------------------------------------------------
+target_layer: 18            # last FLUX double-stream block (blocks 0..18)
+base_k: 2                   # the top 1-2 massive channels that produce the speckles
+outlier_frac: 0.01          # top-1% of tokens by massive score == the speckle set
+rho_ks: [1, 2, 5, 10, 20, 50]   # k sweep for the E1 variance-explained curve
+
+# --- nulls (both required; see SPEC) ------------------------------------------
+n_null_trials: 20
+null_rank_lo: 50            # scale-matched window: draw nulls from mid-rank channels,
+null_rank_hi: 500           # NOT uniformly over D (that mostly hits near-dead channels)
+
+# --- E3 layer sweep -----------------------------------------------------------
+norm_profile_stride: 3      # profile every 3rd block (target + first + final always kept)
+
+# --- outputs ------------------------------------------------------------------
+n_spatial_panels: 4         # per-prompt 4-panel figures (rgb / m / N_full / N_ex)
+
+# --- prompts ------------------------------------------------------------------
+# A content mix: textured vs flat backgrounds matters, since Darcet's high-norm tokens
+# preferentially sit on patches redundant with their neighbours.
+prompts:
+  - a red bicycle leaning against a brick wall
+  - a golden retriever sitting on a wooden dock at sunset
+  - a bowl of fresh strawberries on a marble countertop
+  - an astronaut planting a flag on the moon
+  - a single white teacup on a plain grey seamless background
+  - a dense forest canopy seen from below
+  - a city street at night in the rain, neon reflections
+  - a still life of pears and a glass jug on a dark table
