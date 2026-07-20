@@ -144,6 +144,64 @@ def test_analyze_layer_reports_expected_intersection_and_p_value():
     assert row["n_tokens"] == 400
 
 
+# --- rho_at_base_k is exact, not interpolated ---------------------------------
+
+
+def test_rho_at_base_k_is_exact_when_base_k_absent_from_rho_ks():
+    """rho_outlier_at_base_k must be the true k=base_k value, not an np.interp clamp.
+
+    Regression: base_k=2 with rho_ks=[5,10,20] previously reported the k=5 value (via
+    np.interp clamping) while rho_typical_at_base_k returned NaN — two keys for the same
+    k disagreeing. Both must now be the exact base_k=2 medians.
+    """
+    x = _planted_h1()
+    cfg = _cfg(base_k=2, rho_ks=[5, 10, 20])
+    row = hn.analyze_layer(x, cfg, np.random.default_rng(0))
+
+    base = hn.highnorm.top_channels(x, 2)
+    rho = hn.highnorm.norm_fraction(x, base)
+    mask = hn.outlier_mask(x, 2, cfg.outlier_frac)
+    assert row["rho_outlier_at_base_k"] == pytest.approx(float(np.median(rho[mask])))
+    assert row["rho_typical_at_base_k"] == pytest.approx(float(np.median(rho[~mask])))
+    assert np.isfinite(row["rho_typical_at_base_k"]), "must not be NaN just because 2 not in rho_ks"
+
+
+def test_config_normalizes_and_validates_rho_ks(tmp_path):
+    # unsorted + duplicate -> sorted, deduped (so the E1 curve is monotone in x)
+    cfg = hn.load_highnorm_config(_write_cfg(tmp_path, rho_ks=[20, 5, 10, 5]))
+    assert cfg.rho_ks == [5, 10, 20]
+    # empty / non-positive -> rejected up front, not after a full GPU run
+    with pytest.raises(ValueError, match="rho_ks"):
+        hn.load_highnorm_config(_write_cfg(tmp_path, rho_ks=[]))
+    with pytest.raises(ValueError, match="rho_ks"):
+        hn.load_highnorm_config(_write_cfg(tmp_path, rho_ks=[1, 0, 2]))
+
+
+# --- unbounded selectivity/elevation is a signal, not "inconclusive" -----------
+
+
+def test_infinite_effect_size_is_not_inconclusive():
+    """A perfectly token-sparse channel (median typical score 0) gives selectivity=inf.
+
+    That is the strongest H1/H2 evidence, so the verdict must NOT collapse to
+    'inconclusive' — the old np.isfinite guard did exactly that.
+    """
+    x = np.zeros((400, 64))
+    x[:20, 0] = 900.0  # channel 0 is exactly zero on every typical token
+    x[:, 1:] = np.random.default_rng(0).normal(size=(400, 63))
+    row = hn.analyze_layer(x, _cfg(base_k=1, n_null_trials=0), np.random.default_rng(0))
+    assert np.isinf(row["selectivity"])
+    summary = hn.summarize([row])
+    assert summary["verdict"] != "inconclusive"
+    assert summary["verdict"] in {"H1", "H2"}
+
+
+def test_ratio_zero_over_zero_is_nan_not_inf():
+    assert np.isnan(hn._ratio(np.zeros(5), np.zeros(5)))
+    assert np.isinf(hn._ratio(np.ones(5), np.zeros(5)))
+    assert hn._ratio(np.array([4.0, 4.0]), np.array([2.0, 2.0])) == pytest.approx(2.0)
+
+
 # --- outlier mask -------------------------------------------------------------
 
 

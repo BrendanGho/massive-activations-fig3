@@ -102,6 +102,11 @@ def _validate(cfg: HighNormConfig, source: str) -> None:
         raise ValueError(f"`prompts` must be a non-empty list (source: {source}).")
     if cfg.base_k <= 0:
         raise ValueError(f"base_k must be positive, got {cfg.base_k}")
+    if not cfg.rho_ks or any(int(k) <= 0 for k in cfg.rho_ks):
+        raise ValueError(f"rho_ks must be a non-empty list of positive ints, got {cfg.rho_ks}")
+    # Normalize so the E1 curve is drawn in ascending order (matplotlib would otherwise
+    # zig-zag) and each k appears once.
+    cfg.rho_ks = sorted({int(k) for k in cfg.rho_ks})
     if not 0.0 < cfg.outlier_frac <= 1.0:
         raise ValueError(f"outlier_frac must be in (0, 1], got {cfg.outlier_frac}")
     if cfg.dtype not in ("bf16", "fp16", "fp32"):
@@ -118,11 +123,18 @@ def _validate(cfg: HighNormConfig, source: str) -> None:
 
 
 def _ratio(a: np.ndarray, b: np.ndarray) -> float:
-    """median(a) / median(b), NaN-safe against an empty or zero-median denominator."""
+    """median(a) / median(b). Empty input or 0/0 -> NaN (undefined); x>0 over 0 -> +inf.
+
+    A zero-median denominator is not a failure: it means over half the typical tokens
+    score exactly zero, so the outliers are *unboundedly* more selective/elevated — the
+    strongest possible signal, which `summarize` reads as such rather than discarding.
+    """
     if a.size == 0 or b.size == 0:
         return float("nan")
-    den = float(np.median(b))
-    return float(np.median(a) / den) if den > 0 else float("inf")
+    num, den = float(np.median(a)), float(np.median(b))
+    if den > 0:
+        return num / den
+    return float("nan") if num == 0 else float("inf")
 
 
 def analyze_layer(
@@ -132,10 +144,12 @@ def analyze_layer(
 ) -> dict[str, Any]:
     """E1 + E2 for one (prompt, layer) image stream. Pure numpy => CPU-testable.
 
-    Returns a flat dict of metrics. The two keys that decide H1 vs H2 are
-    ``rho_outlier_at_base_k`` (E1) and ``iou_deconfounded`` (E2, measured against ``N_ex``).
-    ``iou_confounded`` is reported alongside purely to quantify the circularity being
-    controlled for — it is expected to be ~1 and must never be read as a result.
+    Returns a flat dict of metrics. The verdict (see ``summarize``) is driven by
+    ``selectivity`` and ``elevation``, NOT by ``rho_outlier_at_base_k`` or the overlap
+    stats: rho cannot separate H1 from H3 and the IoU-vs-null test cannot detect H2, so
+    those are reported for characterization only. ``iou_confounded`` (measured against the
+    full norm rather than ``N_ex``) is expected to be ~1 and only quantifies the
+    circularity being controlled for — it must never be read as a result.
     """
     x = np.asarray(image_stream)
     n_tokens = x.shape[0]
@@ -167,11 +181,12 @@ def analyze_layer(
     curve = highnorm.variance_explained_curve(
         x, ks=list(cfg.rho_ks), base_k=cfg.base_k, outlier_frac=cfg.outlier_frac
     )
-    rho_at_base = float(
-        np.interp(cfg.base_k, curve["ks"], curve["rho_outlier"])
-        if cfg.base_k not in curve["ks"]
-        else curve["rho_outlier"][curve["ks"].index(cfg.base_k)]
-    )
+    # rho at exactly base_k: `base` already IS the top-base_k channel set, so this is
+    # exact — no need to interpolate from `curve` (whose ks need not contain base_k, and
+    # np.interp would silently clamp / assume sorted xp).
+    rho_base = highnorm.norm_fraction(x, base)
+    rho_outlier_at_base = float(np.median(rho_base[o_mask]))
+    rho_typical_at_base = float(np.median(rho_base[~o_mask])) if (~o_mask).any() else float("nan")
 
     # Null 1: scale-matched random channels, same k, same downstream pipeline.
     null_ious, null_aurocs = [], []
@@ -207,10 +222,8 @@ def analyze_layer(
         "rho_ks": curve["ks"],
         "rho_outlier": curve["rho_outlier"],
         "rho_typical": curve["rho_typical"],
-        "rho_outlier_at_base_k": rho_at_base,
-        "rho_typical_at_base_k": float(curve["rho_typical"][curve["ks"].index(cfg.base_k)])
-        if cfg.base_k in curve["ks"]
-        else float("nan"),
+        "rho_outlier_at_base_k": rho_outlier_at_base,
+        "rho_typical_at_base_k": rho_typical_at_base,
         # E2 (deconfounded — the actual result)
         "iou_deconfounded": deconf["iou"],
         "n_intersection": deconf["n_intersection"],
@@ -262,8 +275,10 @@ def summarize(per_prompt: list[dict[str, Any]]) -> dict[str, Any]:
     """
 
     def med(key: str) -> float:
+        # Keep +/-inf (a genuine unbounded selectivity/elevation signal); drop only NaN
+        # (undefined). np.median propagates inf sensibly: median([inf, 1, 2]) == 2.
         vals = [p[key] for p in per_prompt if p.get(key) is not None]
-        vals = [v for v in vals if isinstance(v, (int, float)) and np.isfinite(v)]
+        vals = [v for v in vals if isinstance(v, (int, float)) and not np.isnan(v)]
         return float(np.median(vals)) if vals else float("nan")
 
     rho_out = med("rho_outlier_at_base_k")
@@ -273,8 +288,10 @@ def summarize(per_prompt: list[dict[str, Any]]) -> dict[str, Any]:
     selectivity = med("selectivity")
     elevation = med("elevation")
 
-    if not (np.isfinite(selectivity) and np.isfinite(elevation)):
-        verdict, reading = "inconclusive", "Effect sizes were not finite; inspect per_prompt.csv."
+    # Only NaN (undefined) is inconclusive; +inf is a valid unbounded signal that the
+    # threshold comparisons below handle correctly (inf < 10 -> False, inf >= 1.5 -> True).
+    if np.isnan(selectivity) or np.isnan(elevation):
+        verdict, reading = "inconclusive", "Effect sizes were undefined; inspect per_prompt.csv."
     elif selectivity < SELECTIVITY_MIN:
         verdict, reading = (
             "H3",
