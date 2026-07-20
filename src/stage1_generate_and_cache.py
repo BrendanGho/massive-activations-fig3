@@ -52,7 +52,7 @@ def write_run_metadata(cfg: Config, prompts: list[str], model_info: dict | None)
             "capture": {
                 "timestep": "last denoising step only (hook overwrite -> last forward wins)",
                 "stream": "image-stream tokens only; text/image split derived at runtime from N_I",
-                "score": "abs(mean_over_tokens) — mean then abs",
+                "score": "mean(abs(activations)) over tokens — abs then mean",
             },
         },
         "model_info": model_info or {},

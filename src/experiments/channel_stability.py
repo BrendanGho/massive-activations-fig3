@@ -6,7 +6,7 @@ generation to the next?*
 
 Method (deliberately narrower than the fig3 pipeline): fix ONE transformer block and ONE
 timestep, run a small cross-product of ``prompts × seeds`` **scenarios**, rank channels
-**independently per scenario** by the massive-activation score ``abs(mean_over_tokens)``,
+**independently per scenario** by the massive-activation score ``mean(abs(activations))``,
 and analyze how stable the top-channel *identities* are across scenarios. No BiRefNet / mIoU.
 
 Reuses (unchanged): ``model_utils`` (load/capture/generate), ``stage2.rank_channels`` /
@@ -64,7 +64,7 @@ class ScenarioConfig:
     # last step (primary analysis stays last-step). None -> last step only.
     capture_steps: list[int] | None = None
     # Complementary token-localized ranking metric: "p999" (abs 99.9th pct over tokens),
-    # "max" (abs max), or None to disable. Primary metric stays abs(mean_over_tokens).
+    # "max" (abs max), or None to disable. Primary metric stays mean(abs(activations)).
     secondary_metric: str | None = "p999"
 
     def to_dict(self) -> dict[str, Any]:
@@ -701,7 +701,7 @@ def write_run_metadata(
         "versions": io.package_versions(),
         "n_scenarios": len(scenarios),
         "assumptions": {
-            "score": "abs(mean_over_tokens) — mean then abs (fig3 massive-activation score)",
+            "score": "mean(abs(activations)) over tokens — abs then mean (fig3 massive-activation score)",
             "secondary_score": (
                 f"{cfg.secondary_metric}: quantile-over-tokens of abs(activation) "
                 "(token-localized complement)"

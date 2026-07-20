@@ -10,8 +10,9 @@ Automated (CPU, `uv run pytest` — currently green):
 
 - **AC1 — config precedence & fail-loud.** CLI > `FIG3_*` env > YAML; unknown keys and
   any empty required key raise. *(test_fig3_config.py)*
-- **AC2 — mean-then-abs ranking.** `score = abs(mean_over_tokens)`; on data where
-  `mean(abs)` and `abs(mean)` disagree, top-/bottom-k follow `abs(mean)`. *(test_fig3_ranking.py)*
+- **AC2 — abs-then-mean ranking.** `score = mean(abs(activations))` over tokens; on data
+  where `mean(abs)` and `abs(mean)` disagree, top-/bottom-k follow `mean(abs)`.
+  *(test_fig3_ranking.py)*
 - **AC3 — top/bottom selection.** top-k = highest scores, bottom-k = lowest, disjoint,
   correct against a brute-force check. *(test_fig3_ranking.py)*
 - **AC4 — seeded random-k.** `random_k_trials` draws without replacement, reproducible,

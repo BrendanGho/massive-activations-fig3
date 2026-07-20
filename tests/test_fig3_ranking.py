@@ -1,4 +1,4 @@
-"""Stage 2 ranking: the mean-then-abs invariant and seeded random draws."""
+"""Stage 2 ranking: the abs-then-mean invariant and seeded random draws."""
 
 from __future__ import annotations
 
@@ -7,20 +7,20 @@ import numpy as np
 from src.stage2_channel_ranking import channel_scores, derive_rng, rank_channels
 
 
-def test_score_is_abs_of_mean_not_mean_of_abs():
-    # ch0: +/-10 -> mean 0, |mean| 0  (mean-of-abs would be 10 -> WRONG ranking)
-    # ch1: constant 1 -> |mean| 1
-    # ch2: constant 0.5 -> |mean| 0.5
+def test_score_is_mean_of_abs_not_abs_of_mean():
+    # ch0: +/-10 -> mean(abs) 10  (abs-of-mean would be 0 -> WRONG ranking)
+    # ch1: constant 1 -> mean(abs) 1
+    # ch2: constant 0.5 -> mean(abs) 0.5
     stream = np.array(
         [[10.0, 1.0, 0.5], [-10.0, 1.0, 0.5]],
         dtype=np.float64,
     )
     score = channel_scores(stream)
-    assert np.allclose(score, [0.0, 1.0, 0.5])
+    assert np.allclose(score, [10.0, 1.0, 0.5])
 
     res = rank_channels(stream, top_k=1, random_k_trials=0, seed=0, prompt_id=0, layer=0)
-    assert res.top_idx.tolist() == [1]  # highest |mean| is ch1, NOT ch0
-    assert res.bottom_idx.tolist() == [0]  # lowest |mean| is ch0
+    assert res.top_idx.tolist() == [0]  # highest mean(abs) is ch0, NOT ch1
+    assert res.bottom_idx.tolist() == [2]  # lowest mean(abs) is ch2
 
 
 def test_top_bottom_ordering():

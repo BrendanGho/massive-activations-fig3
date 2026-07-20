@@ -1,7 +1,7 @@
 """Stage 2 — per-layer channel ranking.
 
-Core invariant (do not "simplify"): the channel score is ``abs(mean_over_tokens)``
-— mean **then** abs, NOT ``mean(abs(...))``. The two give different rankings, and
+Core invariant (do not "simplify"): the channel score is ``mean(abs(activations))``
+— abs **then** mean, NOT ``abs(mean(...))``. The two give different rankings, and
 the whole result depends on getting this right.
 
 Ranking stats are computed per-sample / per-layer / per-stream. Never average raw
@@ -24,7 +24,7 @@ from src.common.config import load_config, parse_set_overrides
 
 @dataclass
 class RankingResult:
-    scores: np.ndarray  # (D,) float — abs(mean_over_tokens)
+    scores: np.ndarray  # (D,) float — mean(abs(activations)) over tokens
     top_idx: np.ndarray  # (k,) int32
     bottom_idx: np.ndarray  # (k,) int32
     random_idx: np.ndarray  # (R, k) int32
@@ -37,22 +37,21 @@ def derive_rng(seed: int, prompt_id: int, layer: int, trial: int) -> np.random.G
 
 
 def channel_scores(image_stream: np.ndarray) -> np.ndarray:
-    """score = abs(mean over tokens). image_stream: (N_tokens, D) -> (D,).
+    """score = mean over tokens of abs(activation). image_stream: (N_tokens, D) -> (D,).
 
-    THE ORDERING MATTERS: mean first (over axis 0 = tokens), then abs.
+    THE ORDERING MATTERS: abs first (elementwise), then mean (over axis 0 = tokens).
     """
     acts = np.asarray(image_stream, dtype=np.float64)
     if acts.ndim != 2:
         raise ValueError(f"image_stream must be 2D (N_tokens, D), got {acts.shape}")
-    mu = acts.mean(axis=0)  # (D,)
-    return np.abs(mu)
+    return np.abs(acts).mean(axis=0)
 
 
 def channel_scores_max(image_stream: np.ndarray, q: float = 0.999) -> np.ndarray:
     """Complementary token-localized score: quantile-over-tokens of ``abs(activation)``.
 
     ``q=1.0`` is the per-channel abs max. This is NOT a replacement for
-    ``channel_scores`` (the fig3 mean-then-abs invariant); it exists to catch channels
+    ``channel_scores`` (the abs-then-mean invariant); it exists to catch channels
     that are massive at only a few tokens, which the mean dilutes.
     image_stream: (N_tokens, D) -> (D,).
     """
@@ -74,7 +73,7 @@ def rank_channels(
 ) -> RankingResult:
     """Rank channels for one (prompt, layer) image stream.
 
-    top_k_idx    = highest scores; bottom_k_idx = lowest scores (mean-then-abs).
+    top_k_idx    = highest scores; bottom_k_idx = lowest scores (abs-then-mean).
     random_idx   = ``random_k_trials`` seeded draws without replacement, seed
                    derived from (seed, prompt_id, layer, trial).
     """

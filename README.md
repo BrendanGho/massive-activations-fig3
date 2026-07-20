@@ -104,8 +104,8 @@ python -m src.stage4_evaluate_figure3d  --config cfg.yaml
    is derived at runtime from the model's packed sequence (`N_I` = image-latent token
    count), never a hard-coded offset. Last timestep is captured by hooks overwriting a
    per-layer buffer each forward.
-2. **Channel score = `abs(mean_over_tokens)` — mean *then* abs**, not `mean(abs(...))`.
-   The ordering changes the ranking. (`test_fig3_ranking.py` pins this.)
+2. **Channel score = `mean(abs(activations))` over tokens — abs *then* mean**, not
+   `abs(mean(...))`. The ordering changes the ranking. (`test_fig3_ranking.py` pins this.)
 3. **Ranking stats are per-sample / per-layer / per-stream** — activations/scores are
    never averaged across samples before ranking.
 4. **Stage 3 order:** min-max normalize each channel across tokens **first**, then
@@ -124,7 +124,7 @@ python -m src.stage4_evaluate_figure3d  --config cfg.yaml
 
 **Sanity targets** (printed as warnings, not asserted): top-k dominates every layer,
 bottom-k flat ≈ 0.2, random-k between, FLUX.2-klein top-k peak ≈ 0.5 near layer 10.
-If the shape is off, the likely culprits are the normalization order or the mean-then-abs
+If the shape is off, the likely culprits are the normalization order or the abs-then-mean
 ranking.
 
 ## Part 2 — per-generation channel stability (the main experiment)
@@ -147,7 +147,7 @@ exists to make:
 and `stability_overlap.png` shows the block-structured pairwise matrix (diagonal blocks =
 same prompt) beside a same-prompt vs diff-prompt pair plot.
 
-**Scores.** Primary = `abs(mean_over_tokens)` (the fig3 massive-activation score;
+**Scores.** Primary = `mean(abs(activations))` over tokens (the fig3 massive-activation score;
 invariant #2 above). Secondary (`secondary_metric: p999`) = 99.9th percentile of
 `abs(activation)` over tokens — a token-localized complement that catches channels
 massive at only a few tokens, which the mean dilutes. The summary reports per-k
@@ -198,7 +198,7 @@ later is the same config swap — no code change.
 uv run pytest -q
 ```
 
-Covers the CPU-testable core: config precedence/validation, the mean-then-abs ranking
+Covers the CPU-testable core: config precedence/validation, the abs-then-mean ranking
 invariant, seeded random draws, Stage 3 normalization + foreground selection, IoU,
 nearest upsampling, resumable cache round-trip, and torch-free importability of every
 stage. The model-touching paths (FLUX.2-klein capture, BiRefNet) are exercised on Colab.

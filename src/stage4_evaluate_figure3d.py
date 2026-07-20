@@ -130,7 +130,7 @@ def sanity_check(results: dict) -> list[str]:
     """Print (not assert) warnings if the curve shape deviates from the targets.
 
     Likely bug locations if this trips: normalization order (Stage 3 step 1) or the
-    mean-then-abs ranking (Stage 2).
+    abs-then-mean ranking (Stage 2).
     """
     warnings: list[str] = []
     layers = sorted({layer for (layer, _s) in results})
@@ -149,7 +149,7 @@ def sanity_check(results: dict) -> list[str]:
     ]
     if dominated:
         warnings.append(
-            f"top-k does NOT dominate at layers {dominated} — check mean-then-abs ranking."
+            f"top-k does NOT dominate at layers {dominated} — check abs-then-mean ranking."
         )
 
     # 2. bottom-k should be flat and low (~0.2).
