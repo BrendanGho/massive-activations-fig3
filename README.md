@@ -185,11 +185,18 @@ bright speckles — are those speckle tokens the **high-norm / register tokens**
 Darcet et al. ([arXiv:2309.16588](https://arxiv.org/abs/2309.16588))? Where Part 2 is
 channel-space only, this is a **token-space** question.
 
-**The confound the design exists to control.** `‖x‖² = Σ_d x[d]²`, so a token with a massive
-value in one channel is high-norm *by construction*. Correlating the massive-channel score
-against the full token norm is circular and always returns overlap ≈ 1. Every statistic is
-therefore computed against `N_ex` — the norm with the massive channels **excised**. The
-confounded number is still reported, but only to show the size of the artifact.
+**Start here — the qualitative look.** `src/experiments/highnorm_qualitative.py` is the
+simplest version: no statistics, one row per prompt — generated image | isolated top-1
+channel (the speckles) | high-norm tokens (full norm) | high-norm tokens (norm minus the
+top channel). The full-norm panel is a carbon copy of the speckles (that's the confound
+below, made visible); whether the last panel still lights up at those spots is the whole
+question. `python -m src.experiments.highnorm_qualitative --config configs/highnorm_tokens.yaml`
+
+**The confound the quantitative design exists to control.** `‖x‖² = Σ_d x[d]²`, so a token
+with a massive value in one channel is high-norm *by construction*. Correlating the
+massive-channel score against the full token norm is circular and always returns overlap ≈ 1.
+Every statistic is therefore computed against `N_ex` — the norm with the massive channels
+**excised**. The confounded number is still reported, but only to show the size of the artifact.
 
 **Verdict rests on two effect sizes**, not on set overlap:
 
