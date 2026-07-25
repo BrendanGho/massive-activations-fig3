@@ -4,6 +4,9 @@
 # Harness local state: the knowledge-store DB and session checkpoints are per-machine
 .harness/
 
+# Agent git worktrees (ephemeral working dirs; must never be committed as gitlinks)
+.claude/worktrees/
+
 # Env & secrets
 .env
 .env.*
