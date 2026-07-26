@@ -27,6 +27,18 @@ import numpy as np
 from src.common import highnorm
 from src.experiments.highnorm_tokens import load_highnorm_config
 
+
+def default_output_name(target_layer: int, n_channels: int) -> str:
+    """Filename encoding the swept hyperparameters, so runs at different layers /
+    channel counts land side by side in the same folder instead of overwriting.
+
+    e.g. ``qualitative_L18_ch1.png``. The output_dir is already per-model (the Colab
+    cell nests it under ``<drive>/<model>/highnorm_qualitative``), so the model need not
+    be in the name; layer and channel count are the knobs actually swept.
+    """
+    return f"qualitative_L{int(target_layer)}_ch{int(n_channels)}.png"
+
+
 # --- pure map builder (no torch/matplotlib) -----------------------------------
 
 
@@ -132,12 +144,16 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--channels", type=int, default=1, help="How many top channels to isolate.")
     p.add_argument("--limit", type=int, default=4, help="Only render the first N prompts.")
     p.add_argument(
-        "--out", default=None, help="Output PNG (default: <output_dir>/qualitative_highnorm.png)."
+        "--out",
+        default=None,
+        help="Output PNG (default: <output_dir>/qualitative_L<layer>_ch<channels>.png).",
     )
     args = p.parse_args(argv)
 
     cfg = load_highnorm_config(args.config)
-    out_path = args.out or os.path.join(cfg.output_dir, "qualitative_highnorm.png")
+    out_path = args.out or os.path.join(
+        cfg.output_dir, default_output_name(cfg.target_layer, args.channels)
+    )
     run(cfg, n_channels=args.channels, out_path=out_path, limit=args.limit)
 
 

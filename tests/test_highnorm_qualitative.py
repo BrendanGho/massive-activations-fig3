@@ -40,3 +40,13 @@ def test_full_norm_matches_speckle_but_deconfounded_does_not():
 def test_panel_maps_rejects_wrong_grid():
     with pytest.raises(ValueError):
         q.panel_maps(np.zeros((63, 16)), n_channels=1, h_lat=8, w_lat=8)
+
+
+def test_default_output_name_encodes_layer_and_channels():
+    assert q.default_output_name(18, 1) == "qualitative_L18_ch1.png"
+    assert q.default_output_name(11, 3) == "qualitative_L11_ch3.png"
+    # different layers / channel counts must not collide (the whole point)
+    assert q.default_output_name(18, 1) != q.default_output_name(19, 1)
+    assert q.default_output_name(18, 1) != q.default_output_name(18, 2)
+    # tolerant of str-typed params coming from a config/CLI
+    assert q.default_output_name("18", "1") == "qualitative_L18_ch1.png"
