@@ -190,7 +190,12 @@ simplest version: no statistics, one row per prompt — generated image | isolat
 channel (the speckles) | high-norm tokens (full norm) | high-norm tokens (norm minus the
 top channel). The full-norm panel is a carbon copy of the speckles (that's the confound
 below, made visible); whether the last panel still lights up at those spots is the whole
-question. `python -m src.experiments.highnorm_qualitative --config configs/highnorm_tokens.yaml`
+question. `--subtract-ks 5,10,20` adds one further "norm minus top-k" column per k, to
+watch the high-norm token fade (or persist) as more massive channels are peeled off; those
+deconfounded columns share one color scale per row so the size of the drop is visible.
+Output is named `qualitative_L<layer>_ch<channels>[_sub5-10-20].png`, so sweeping layers or
+subtract-sets writes side by side instead of overwriting.
+`python -m src.experiments.highnorm_qualitative --config configs/highnorm_tokens.yaml --subtract-ks 5,10,20`
 
 **The confound the quantitative design exists to control.** `‖x‖² = Σ_d x[d]²`, so a token
 with a massive value in one channel is high-norm *by construction*. Correlating the
