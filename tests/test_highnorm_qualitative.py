@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from src.common import highnorm
 from src.experiments import highnorm_qualitative as q
 
 
@@ -105,6 +106,68 @@ def test_default_output_name_encodes_subtract_ks():
     # with vs without subtract must not overwrite each other at the same layer/channels
     assert q.default_output_name(18, 1, [5, 10, 20]) != q.default_output_name(18, 1)
     assert q.default_output_name(18, 1, []) == "qualitative_L18_ch1.png"
+
+
+# --- explicit channel ablation ------------------------------------------------
+
+
+def test_parse_channels():
+    assert q.parse_channels("154,1446") == [154, 1446]
+    assert q.parse_channels("1446, 154, 154") == [154, 1446]  # sorted + deduped
+    assert q.parse_channels("0") == [0]  # channel 0 is valid
+    assert q.parse_channels("") == [] and q.parse_channels(None) == []
+    with pytest.raises(ValueError):
+        q.parse_channels("154,-1")
+    with pytest.raises(ValueError):
+        q.parse_channels("x")
+
+
+def test_panel_maps_uses_explicit_channels_over_top_k():
+    rng = np.random.default_rng(6)
+    h, w = 8, 8
+    x = rng.normal(size=(h * w, 64))
+    x[:, 0] = 900.0  # channel 0 would be the top massive channel...
+    maps = q.panel_maps(x, n_channels=1, h_lat=h, w_lat=w, explicit_channels=[7, 30])
+
+    assert maps["channels"].tolist() == [7, 30], "explicit channels must override top-k"
+    # deconfounded norm must exclude exactly {7, 30}, not channel 0
+    expected = highnorm.token_norms(x, exclude=np.array([7, 30])).reshape(h, w)
+    np.testing.assert_allclose(maps["n_ex"], expected)
+
+
+def test_panel_maps_rejects_out_of_range_ablation():
+    x = np.random.default_rng(7).normal(size=(64, 32))
+    with pytest.raises(ValueError, match="out of range"):
+        q.panel_maps(x, 1, 8, 8, explicit_channels=[40])
+
+
+def test_default_output_name_encodes_ablation():
+    assert q.default_output_name(18, 1, None, [154, 1446]) == "qualitative_L18_ablate154-1446.png"
+    # ablation vs top-k at the same layer must not collide
+    assert q.default_output_name(18, 1, None, [154]) != q.default_output_name(18, 1)
+    # different ablation sets are distinct files
+    assert q.default_output_name(18, 1, None, [154]) != q.default_output_name(18, 1, None, [1446])
+    # subtract suffix still applies under ablation
+    assert q.default_output_name(18, 1, [5, 10], [154]) == "qualitative_L18_ablate154_sub5-10.png"
+
+
+# --- top-channel reporting ----------------------------------------------------
+
+
+def test_top_channel_report_ranks_by_mean_abs():
+    x = np.zeros((10, 5))
+    x[:, 3] = 8.0  # highest mean|abs|
+    x[:, 1] = 4.0
+    x[:, 4] = 2.0
+    report = q.top_channel_report(x, n=3)
+    assert [c for c, _ in report] == [3, 1, 4]
+    assert report[0] == (3, pytest.approx(8.0))
+
+
+def test_top_channel_report_respects_n():
+    x = np.random.default_rng(8).normal(size=(16, 20))
+    assert len(q.top_channel_report(x, 5)) == 5
+    assert len(q.top_channel_report(x, 0)) == 0
 
 
 def test_save_figure_renders_all_columns(tmp_path):

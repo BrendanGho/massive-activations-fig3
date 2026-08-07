@@ -232,6 +232,46 @@ def test_capture_state_step_streams():
     assert state.step_streams == {}
 
 
+def test_capture_pixart_style_4d_conv_latent_input():
+    """PixArt/DiT feed the transformer a 4D conv latent (B, C, H, W) and patchify
+    internally; N_I must come from (H/patch)*(W/patch), not shape[1] (=channels)."""
+    torch = pytest.importorskip("torch")
+    from src.common import model_utils
+
+    ps, h_lat, w_lat, d = 2, 4, 4, 3
+    n_patches = (h_lat // ps) * (w_lat // ps)  # 2*2 = 4 image tokens
+
+    class Block(torch.nn.Module):
+        def forward(self, x):  # x: (B, n_patches, D) — pure image tokens, no text concat
+            return x
+
+    block = Block()
+
+    class Cfg:
+        patch_size = ps
+
+    class Transformer(torch.nn.Module):
+        config = Cfg()
+
+        def forward(self, hidden_states, encoder_hidden_states=None):
+            # emulate patchify: (B, C, H, W) -> (B, n_patches, D); text stays separate
+            return block(torch.zeros(hidden_states.shape[0], n_patches, d))
+
+    tr = Transformer()
+    state = model_utils.CaptureState()
+    refs = [model_utils.BlockRef(layer_id=3, module=block, kind="double")]
+    handles = model_utils.register_capture_hooks(tr, refs, state)
+    try:
+        # classifier-free guidance: batch 2 = [uncond, cond]; conv latent (B, C, H, W)
+        tr(torch.zeros(2, 4, h_lat, w_lat), encoder_hidden_states=torch.zeros(2, 7, d))
+    finally:
+        for h in handles:
+            h.remove()
+
+    assert state.n_image == n_patches, "N_I must be patchified token count, not channel dim"
+    assert state.image_streams[3].shape == (n_patches, d)
+
+
 # --- figures (Agg backend, synthetic data) --------------------------------------
 
 

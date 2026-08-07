@@ -159,10 +159,14 @@ class CaptureState:
 
 
 def _extract_image_stream(output: Any, n_image: int) -> np.ndarray | None:
-    """Pull the [N_I, D] image slice from a block's output, batch index 0.
+    """Pull the [N_I, D] image slice from a block's output.
 
     Chooses the tensor whose seq-len == N_I (image-only block); else the last
-    N_I tokens of a longer [text, image] sequence (single-stream block).
+    N_I tokens of a longer [text, image] sequence (single-stream block). Takes the
+    LAST batch element: under classifier-free guidance the batch is [uncond, cond]
+    (e.g. PixArt), and the conditional/text-guided branch is the one that matches the
+    returned image. FLUX runs batch-1 (guidance is an embedding, not a doubled batch),
+    so -1 is identical to 0 there.
     """
     import torch
 
@@ -189,7 +193,7 @@ def _extract_image_stream(output: Any, n_image: int) -> np.ndarray | None:
         return None
     if chosen.shape[1] > n_image:
         chosen = chosen[:, -n_image:, :]
-    return chosen[0].detach().float().cpu().numpy()
+    return chosen[-1].detach().float().cpu().numpy()
 
 
 def register_capture_hooks(transformer: Any, blocks: list[BlockRef], state: CaptureState):
@@ -199,7 +203,7 @@ def register_capture_hooks(transformer: Any, blocks: list[BlockRef], state: Capt
     """
     handles = []
 
-    def pre_hook(_module, args, kwargs):
+    def pre_hook(module, args, kwargs):
         hidden = kwargs.get("hidden_states")
         if hidden is None and len(args) > 0:
             hidden = args[0]
@@ -207,7 +211,14 @@ def register_capture_hooks(transformer: Any, blocks: list[BlockRef], state: Capt
         if enc is None and len(args) > 1:
             enc = args[1]
         if hidden is not None and hasattr(hidden, "shape"):
-            state.n_image = int(hidden.shape[1])
+            if hidden.dim() == 4:
+                # Conv-latent input (B, C, H, W), e.g. PixArt/DiT: the transformer
+                # patchifies internally, so N_I = (H/patch)*(W/patch). FLUX instead
+                # passes an already-packed (B, N_I, D) sequence, handled by the else.
+                ps = int(getattr(getattr(module, "config", None), "patch_size", 1) or 1)
+                state.n_image = (hidden.shape[-2] // ps) * (hidden.shape[-1] // ps)
+            else:
+                state.n_image = int(hidden.shape[1])
         if enc is not None and hasattr(enc, "shape"):
             state.n_text = int(enc.shape[1])
         state.forward_count += 1

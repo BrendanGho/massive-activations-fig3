@@ -193,9 +193,17 @@ below, made visible); whether the last panel still lights up at those spots is t
 question. `--subtract-ks 5,10,20` adds one further "norm minus top-k" column per k, to
 watch the high-norm token fade (or persist) as more massive channels are peeled off; those
 deconfounded columns share one color scale per row so the size of the drop is visible.
-Output is named `qualitative_L<layer>_ch<channels>[_sub5-10-20].png`, so sweeping layers or
-subtract-sets writes side by side instead of overwriting.
-`python -m src.experiments.highnorm_qualitative --config configs/highnorm_tokens.yaml --subtract-ks 5,10,20`
+`--report-top 15` prints the top channels (by mean|abs|) per prompt plus a cross-prompt
+aggregate, and `--ablate-channels 154,1446` isolates/removes those *explicit* channels
+instead of the top-N — read the printed ranking, then ablate the ones you care about.
+Output is named `qualitative_L<layer>_{ch<n>|ablate<ids>}[_sub5-10-20].png`, so sweeping
+layers / ablation sets / subtract-sets writes side by side instead of overwriting.
+`python -m src.experiments.highnorm_qualitative --config configs/highnorm_tokens.yaml --subtract-ks 5,10,20 --report-top 15`
+
+Model scope: FLUX.1 (schnell/dev) and FLUX.2-klein, plus **PixArt-Sigma** (a DiT that feeds
+the transformer a 4D conv latent and uses real classifier-free guidance — the capture hooks
+handle both; see `model_utils.register_capture_hooks`). Pick the model in the Colab
+`HN_ACTIVE_MODEL` dropdown.
 
 **The confound the quantitative design exists to control.** `‖x‖² = Σ_d x[d]²`, so a token
 with a massive value in one channel is high-norm *by construction*. Correlating the
