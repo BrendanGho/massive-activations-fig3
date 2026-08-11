@@ -23,10 +23,11 @@ Knobs:
 * ``--layers all`` (or ``"0,5,10"``) — sweep layers: every requested layer is captured in one
   generation pass and written to its own ``qualitative_L<layer>.png`` in the channel folder.
 
-The deconfounded columns share one color scale per row, so the *magnitude* of the drop is
-visible; independent auto-scaling would re-brighten each panel and hide it. Reuses
-``highnorm`` (maps) and ``model_utils`` (generate/capture); matplotlib/torch are imported
-lazily so the pure map-builder tests on CPU.
+All the norm columns (3 onward: full norm + every "minus ..." column) share ONE color scale
+per row with a colorbar, so they are directly comparable and you can see whether a high-norm
+token dims to background or persists after ablation; independent auto-scaling would re-brighten
+each panel and hide it. Reuses ``highnorm`` (maps) and ``model_utils`` (generate/capture);
+matplotlib/torch are imported lazily so the pure map-builder tests on CPU.
 
     python -m src.experiments.highnorm_qualitative --config configs/highnorm_tokens.yaml \
         --subtract-ks 5,10,20 --report-top 15
@@ -181,6 +182,26 @@ def _primary_label(n_channels: int, explicit_channels: list[int] | None) -> str:
     return "top-1 channel" if n_channels == 1 else f"top-{n_channels} channels"
 
 
+def norm_columns(maps: dict[str, Any], subtract_ks: list[int] | None = None) -> list[np.ndarray]:
+    """The norm maps shown in columns 3+ (full norm, then each 'norm minus ...'), in order."""
+    return [maps["n_full"], maps["n_ex"], *(maps["subtract"][k] for k in (subtract_ks or []))]
+
+
+def shared_norm_scale(
+    maps: dict[str, Any], subtract_ks: list[int] | None = None
+) -> tuple[float, float]:
+    """One (vmin, vmax) spanning ALL norm columns, so they are directly comparable.
+
+    Removing channels can only lower a token's norm, so ``n_full`` bounds the top of the
+    scale; the min is the smallest value across the fully-ablated map. On this shared scale
+    a high-norm token that is *only* the massive channel drops to background (visibly dims)
+    once that channel is removed, while a genuinely elevated token stays bright — which is
+    the comparison the columns exist to make.
+    """
+    cols = norm_columns(maps, subtract_ks)
+    return float(min(m.min() for m in cols)), float(max(m.max() for m in cols))
+
+
 # --- figure (matplotlib lazy) -------------------------------------------------
 
 
@@ -211,33 +232,39 @@ def _save_figure(
     fig, axes = plt.subplots(n, ncols, figsize=(3.0 * ncols, 3.1 * n), squeeze=False)
     for r, row in enumerate(rows):
         maps = row["maps"]
-        deconf = [maps["n_ex"], *(maps["subtract"][k] for k in subtract_ks)]
-        # Shared scale across the deconfounded columns so the high-norm token visibly
-        # fades as more channels are peeled (per-panel autoscale would hide the drop).
-        # n_full keeps its own scale — it is the confound reference, dominated by the
-        # massive channel, and would otherwise crush every deconfounded panel to black.
-        d_lo = float(min(m.min() for m in deconf))
-        d_hi = float(max(m.max() for m in deconf))
+        norm_maps = norm_columns(maps, subtract_ks)
+        # ONE shared scale across all norm columns (full norm + every ablated norm), so they
+        # are directly comparable: a token that is high-norm only because of the ablated
+        # channel(s) drops to background here (visibly dims), while a genuinely elevated
+        # token stays bright. That side-by-side dim-or-not is the whole point.
+        v_lo, v_hi = shared_norm_scale(maps, subtract_ks)
         cells = [
             (row["rgb"], None, None, None),
             (maps["speckle"], "inferno", None, None),
-            (maps["n_full"], "viridis", None, None),
-            *((m, "viridis", d_lo, d_hi) for m in deconf),
+            *((m, "viridis", v_lo, v_hi) for m in norm_maps),
         ]
+        im_norm = None
         for c, (img, cmap, vlo, vhi) in enumerate(cells):
             ax = axes[r][c]
-            ax.imshow(img, cmap=cmap, vmin=vlo, vmax=vhi, interpolation="nearest")
+            im = ax.imshow(img, cmap=cmap, vmin=vlo, vmax=vhi, interpolation="nearest")
+            if c == 2:  # first norm column carries the shared mappable for the colorbar
+                im_norm = im
             ax.set_xticks([])
             ax.set_yticks([])
             if r == 0:
                 ax.set_title(titles[c], fontsize=10)
         axes[r][0].set_ylabel(row["prompt"][:32], fontsize=8)
+        # One colorbar per row spanning the norm columns, so "dims or not" is readable as
+        # an absolute token-norm value, not just a relative shade.
+        if im_norm is not None:
+            norm_axes = [axes[r][c] for c in range(2, ncols)]
+            fig.colorbar(im_norm, ax=norm_axes, fraction=0.015, pad=0.01, label="token L2 norm")
     fig.suptitle(
-        f"Massive-activation speckles vs high-norm tokens — layer {layer}",
-        fontsize=12,
+        f"Massive-activation speckles vs high-norm tokens — layer {layer}\n"
+        f"(columns 3+ share one color scale — watch the high-norm tokens dim or persist)",
+        fontsize=11,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.98))
-    fig.savefig(path, dpi=150)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 

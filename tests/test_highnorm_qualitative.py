@@ -219,6 +219,33 @@ def test_resolve_layers_rejects_out_of_range():
         q.resolve_layers("0,99", list(range(28)), target_layer=0)
 
 
+def test_norm_columns_order_is_full_then_ablated():
+    x = np.random.default_rng(9).normal(size=(64, 64))
+    x[20, 0] = 500.0
+    maps = q.panel_maps(x, 1, 8, 8, subtract_ks=[5, 10])
+    cols = q.norm_columns(maps, [5, 10])
+    assert len(cols) == 4  # full, minus-primary, minus-5, minus-10
+    np.testing.assert_array_equal(cols[0], maps["n_full"])
+    np.testing.assert_array_equal(cols[1], maps["n_ex"])
+
+
+def test_shared_norm_scale_spans_every_norm_column():
+    """Columns 3+ must share one scale so dimming is comparable, not per-panel re-brightened."""
+    x = np.random.default_rng(10).normal(size=(64, 64))
+    x[20, 0] = 500.0  # token 20 high-norm only via channel 0
+    maps = q.panel_maps(x, 1, 8, 8, subtract_ks=[5, 10])
+    lo, hi = q.shared_norm_scale(maps, [5, 10])
+
+    cols = q.norm_columns(maps, [5, 10])
+    assert hi == pytest.approx(max(m.max() for m in cols))
+    assert lo == pytest.approx(min(m.min() for m in cols))
+    # removing channels only lowers the norm, so full norm bounds the top of the scale
+    assert hi == pytest.approx(maps["n_full"].max())
+    # and on that shared scale, ablating channel 0 drops token 20 far below the top
+    peak = (20 // 8, 20 % 8)
+    assert maps["n_ex"][peak] < 0.3 * hi, "the ablated token should dim on the shared scale"
+
+
 def test_save_figure_renders_all_columns(tmp_path):
     """End-to-end figure smoke test: the PNG writes and has the expected column count."""
     rng = np.random.default_rng(5)
