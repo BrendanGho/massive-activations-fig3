@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 
@@ -91,21 +93,44 @@ def test_parse_ks():
         q.parse_ks("5,abc")
 
 
-def test_default_output_name_encodes_layer_and_channels():
-    assert q.default_output_name(18, 1) == "qualitative_L18_ch1.png"
-    assert q.default_output_name(11, 3) == "qualitative_L11_ch3.png"
+def test_default_output_name_puts_layer_in_filename_under_a_variant_folder():
+    assert q.default_output_name(18, 1) == os.path.join("top_ch1", "qualitative_L18.png")
+    assert q.default_output_name(11, 3) == os.path.join("top_ch3", "qualitative_L11.png")
     # different layers / channel counts must not collide (the whole point)
     assert q.default_output_name(18, 1) != q.default_output_name(19, 1)
     assert q.default_output_name(18, 1) != q.default_output_name(18, 2)
     # tolerant of str-typed params coming from a config/CLI
-    assert q.default_output_name("18", "1") == "qualitative_L18_ch1.png"
+    assert q.default_output_name("18", "1") == os.path.join("top_ch1", "qualitative_L18.png")
 
 
-def test_default_output_name_encodes_subtract_ks():
-    assert q.default_output_name(18, 1, [5, 10, 20]) == "qualitative_L18_ch1_sub5-10-20.png"
+def test_layer_sweep_shares_folder_but_channel_sets_get_own_folder():
+    """The whole point of the folder scheme: sweep all layers x a few channel sets."""
+    # sweeping layers for one channel set -> same folder, different files
+    a = q.default_output_name(0, 1, None, [154])
+    b = q.default_output_name(27, 1, None, [154])
+    assert os.path.dirname(a) == os.path.dirname(b) == "ablate_154"
+    assert os.path.basename(a) == "qualitative_L0.png"
+    assert os.path.basename(b) == "qualitative_L27.png"
+    # a different ablated channel -> a different folder
+    assert os.path.dirname(q.default_output_name(0, 1, None, [1446])) == "ablate_1446"
+    assert os.path.dirname(a) != os.path.dirname(q.default_output_name(0, 1, None, [1446]))
+    # top-N mode is its own folder family, separate from ablation
+    assert os.path.dirname(q.default_output_name(0, 1)) == "top_ch1"
+
+
+def test_variant_dir():
+    assert q.variant_dir(1) == "top_ch1"
+    assert q.variant_dir(5) == "top_ch5"
+    assert q.variant_dir(1, [154, 1446]) == "ablate_154-1446"
+
+
+def test_default_output_name_encodes_subtract_ks_in_filename():
+    assert q.default_output_name(18, 1, [5, 10, 20]) == os.path.join(
+        "top_ch1", "qualitative_L18_sub5-10-20.png"
+    )
     # with vs without subtract must not overwrite each other at the same layer/channels
     assert q.default_output_name(18, 1, [5, 10, 20]) != q.default_output_name(18, 1)
-    assert q.default_output_name(18, 1, []) == "qualitative_L18_ch1.png"
+    assert q.default_output_name(18, 1, []) == os.path.join("top_ch1", "qualitative_L18.png")
 
 
 # --- explicit channel ablation ------------------------------------------------
@@ -142,13 +167,17 @@ def test_panel_maps_rejects_out_of_range_ablation():
 
 
 def test_default_output_name_encodes_ablation():
-    assert q.default_output_name(18, 1, None, [154, 1446]) == "qualitative_L18_ablate154-1446.png"
-    # ablation vs top-k at the same layer must not collide
+    assert q.default_output_name(18, 1, None, [154, 1446]) == os.path.join(
+        "ablate_154-1446", "qualitative_L18.png"
+    )
+    # ablation vs top-k at the same layer must not collide (different folders)
     assert q.default_output_name(18, 1, None, [154]) != q.default_output_name(18, 1)
-    # different ablation sets are distinct files
+    # different ablation sets are distinct files (different folders)
     assert q.default_output_name(18, 1, None, [154]) != q.default_output_name(18, 1, None, [1446])
-    # subtract suffix still applies under ablation
-    assert q.default_output_name(18, 1, [5, 10], [154]) == "qualitative_L18_ablate154_sub5-10.png"
+    # subtract suffix still applies under ablation, in the filename
+    assert q.default_output_name(18, 1, [5, 10], [154]) == os.path.join(
+        "ablate_154", "qualitative_L18_sub5-10.png"
+    )
 
 
 # --- top-channel reporting ----------------------------------------------------

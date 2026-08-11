@@ -75,28 +75,35 @@ def parse_channels(spec: str | None) -> list[int]:
     return sorted(out)
 
 
+def variant_dir(n_channels: int, explicit_channels: list[int] | None = None) -> str:
+    """Subfolder name for one *channel variant* (the thing held fixed while sweeping layers).
+
+    ``ablate_154-1446`` for explicit channels, else ``top_ch1``. A full layer sweep for one
+    channel set therefore lands together in one folder, and a different channel set gets its
+    own folder — which is what you want when sweeping layers x a few channel sets.
+    """
+    if explicit_channels:
+        return "ablate_" + "-".join(str(int(c)) for c in explicit_channels)
+    return f"top_ch{int(n_channels)}"
+
+
 def default_output_name(
     target_layer: int,
     n_channels: int,
     subtract_ks: list[int] | None = None,
     explicit_channels: list[int] | None = None,
 ) -> str:
-    """Filename encoding the swept hyperparameters, so runs at different layers / channel
-    counts / ablation sets / subtract-sets land side by side instead of overwriting.
+    """Relative path ``<variant>/qualitative_L<layer>[_sub5-10-20].png``.
 
-    e.g. ``qualitative_L18_ch1.png``, ``qualitative_L18_ablate154-1446.png``, or with a
-    ``_sub5-10-20`` suffix. The output_dir is already per-model (the Colab cell nests it
-    under ``<drive>/<model>/highnorm_qualitative``), so the model need not be in the name.
+    The ``<variant>`` subfolder (see :func:`variant_dir`) groups a whole layer sweep for one
+    channel set; the layer lives in the filename. Different layers -> same folder, different
+    files; different channel sets -> different folders. The output_dir is already per-model
+    (the Colab cell nests it under ``<drive>/<model>/highnorm_qualitative``).
     """
-    if explicit_channels:
-        stem = f"qualitative_L{int(target_layer)}_ablate" + "-".join(
-            str(int(c)) for c in explicit_channels
-        )
-    else:
-        stem = f"qualitative_L{int(target_layer)}_ch{int(n_channels)}"
+    fname = f"qualitative_L{int(target_layer)}"
     if subtract_ks:
-        stem += "_sub" + "-".join(str(int(k)) for k in subtract_ks)
-    return stem + ".png"
+        fname += "_sub" + "-".join(str(int(k)) for k in subtract_ks)
+    return os.path.join(variant_dir(n_channels, explicit_channels), fname + ".png")
 
 
 # --- pure map builder (no torch/matplotlib) -----------------------------------
@@ -282,6 +289,9 @@ def run(
         agg = ", ".join(f"{c}(x{n})" for c, n in top_counts.most_common(report_top))
         print(f"[qual] most frequent top channels across {len(rows)} prompt(s): {agg}")
 
+    out_parent = os.path.dirname(out_path)
+    if out_parent:
+        os.makedirs(out_parent, exist_ok=True)  # the per-variant subfolder
     _save_figure(out_path, rows, cfg.target_layer, n_channels, subtract_ks, explicit_channels)
     print(f"[qual] wrote {out_path}")
     return out_path
