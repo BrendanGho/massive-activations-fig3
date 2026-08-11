@@ -199,6 +199,26 @@ def test_top_channel_report_respects_n():
     assert len(q.top_channel_report(x, 0)) == 0
 
 
+# --- layer sweep resolution ---------------------------------------------------
+
+
+def test_resolve_layers():
+    all_ids = list(range(28))  # e.g. PixArt-Sigma
+    # empty / None -> just the config target
+    assert q.resolve_layers("", all_ids, target_layer=18) == [18]
+    assert q.resolve_layers(None, all_ids, target_layer=7) == [7]
+    # 'all' -> every block, in order
+    assert q.resolve_layers("all", all_ids, 18) == all_ids
+    assert q.resolve_layers("ALL", all_ids, 18) == all_ids  # case-insensitive
+    # explicit list -> sorted + deduped
+    assert q.resolve_layers("10, 0, 5, 0", all_ids, 18) == [0, 5, 10]
+
+
+def test_resolve_layers_rejects_out_of_range():
+    with pytest.raises(ValueError, match="not in model"):
+        q.resolve_layers("0,99", list(range(28)), target_layer=0)
+
+
 def test_save_figure_renders_all_columns(tmp_path):
     """End-to-end figure smoke test: the PNG writes and has the expected column count."""
     rng = np.random.default_rng(5)

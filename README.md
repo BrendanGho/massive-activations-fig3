@@ -196,9 +196,13 @@ deconfounded columns share one color scale per row so the size of the drop is vi
 `--report-top 15` prints the top channels (by mean|abs|) per prompt plus a cross-prompt
 aggregate, and `--ablate-channels 154,1446` isolates/removes those *explicit* channels
 instead of the top-N — read the printed ranking, then ablate the ones you care about.
-Outputs are foldered by channel variant: `<output_dir>/{ablate_<ids>|top_ch<n>}/qualitative_L<layer>[_sub5-10-20].png`.
-So a full layer sweep for one channel set lands in one folder, and each different ablated
-channel gets its own folder — built for sweeping all layers × a few channel sets.
+`--layers all` (or `"0,5,10"`) sweeps layers: every requested block is captured in a
+**single** generation pass (the image is generated once, not reloaded/regenerated per
+layer), and each layer is written to its own file. Outputs are foldered by channel variant:
+`<output_dir>/{ablate_<ids>|top_ch<n>}/qualitative_L<layer>[_sub5-10-20].png`. So a full
+layer sweep for one channel set lands in one folder, and each different ablated channel gets
+its own folder — built for sweeping all layers × a few channel sets. (Capturing every layer
+holds ~`n_layers × N × D` of CPU RAM at peak; pass a layer subset if memory-constrained.)
 `python -m src.experiments.highnorm_qualitative --config configs/highnorm_tokens.yaml --subtract-ks 5,10,20 --report-top 15`
 
 Model scope: FLUX.1 (schnell/dev) and FLUX.2-klein, plus **PixArt-Sigma** (a DiT that feeds

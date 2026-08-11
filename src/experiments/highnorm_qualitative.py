@@ -20,6 +20,8 @@ Knobs:
   high-norm token fade (or persist) as progressively more massive channels are peeled off.
 * ``--report-top N`` — print the top-N channels (by mean|abs|) per prompt, plus an aggregate,
   so you know which channels to ablate.
+* ``--layers all`` (or ``"0,5,10"``) — sweep layers: every requested layer is captured in one
+  generation pass and written to its own ``qualitative_L<layer>.png`` in the channel folder.
 
 The deconfounded columns share one color scale per row, so the *magnitude* of the drop is
 visible; independent auto-scaling would re-brighten each panel and hide it. Reuses
@@ -242,59 +244,103 @@ def _save_figure(
 # --- runner -------------------------------------------------------------------
 
 
+def resolve_layers(spec: str | None, all_ids: list[int], target_layer: int) -> list[int]:
+    """Which layers to render. ``""``/None -> [target_layer]; ``"all"`` -> every block;
+    ``"0,5,10"`` -> those (validated against the model's block ids)."""
+    if not spec or not str(spec).strip():
+        return [int(target_layer)]
+    s = str(spec).strip().lower()
+    if s == "all":
+        return list(all_ids)
+    want = sorted({int(p) for p in s.split(",") if p.strip()})
+    available = set(all_ids)
+    missing = [ly for ly in want if ly not in available]
+    if missing:
+        raise ValueError(f"requested layers not in model (available 0..{max(all_ids)}): {missing}")
+    return want
+
+
 def run(
     cfg,
     n_channels: int,
-    out_path: str,
     limit: int | None,
     subtract_ks: list[int] | None = None,
     explicit_channels: list[int] | None = None,
     report_top: int = 10,
-) -> str:
+    layers_spec: str | None = None,
+    out_override: str | None = None,
+) -> list[str]:
+    """Render the qualitative figure for one or more layers.
+
+    All requested layers are captured in a SINGLE generation pass (hooks on every wanted
+    block), so a full layer sweep generates each image once rather than reloading the model
+    or regenerating per layer. Only the small per-layer maps are kept; the big [N, D] streams
+    live transiently in the capture buffer (~n_layers x N x D of CPU RAM at peak).
+    """
     from src.common import model_utils
 
     prompts = cfg.prompts if limit is None else cfg.prompts[:limit]
 
     pipe = model_utils.load_pipeline(cfg, offload=cfg.offload)
-    blocks = model_utils.select_layers(
-        model_utils.discover_blocks(pipe.transformer), [cfg.target_layer]
-    )
+    all_blocks = model_utils.discover_blocks(pipe.transformer)
+    all_ids = [b.layer_id for b in all_blocks]
+    want = resolve_layers(layers_spec, all_ids, cfg.target_layer)
+    if out_override is not None and len(want) > 1:
+        raise ValueError(
+            "--out is only valid for a single layer; a multi-layer sweep writes one "
+            "file per layer under output_dir. Drop --out or request a single layer."
+        )
+
+    blocks = model_utils.select_layers(all_blocks, want)
     state = model_utils.CaptureState()
     handles = model_utils.register_capture_hooks(pipe.transformer, blocks, state)
 
-    rows: list[dict[str, Any]] = []
-    top_counts: Counter[int] = Counter()
+    rows_by_layer: dict[int, list[dict[str, Any]]] = {ly: [] for ly in want}
+    counts_by_layer: dict[int, Counter[int]] = {ly: Counter() for ly in want}
+    single = len(want) == 1
     try:
         for pid, prompt in enumerate(prompts):
             rgb, info = model_utils.generate_with_capture(pipe, prompt, cfg, state)
-            if cfg.target_layer not in state.image_streams:
-                raise RuntimeError(f"no capture at layer {cfg.target_layer} for prompt {pid}")
-            x = state.image_streams[cfg.target_layer]
-            maps = panel_maps(
-                x, n_channels, info["h_lat"], info["w_lat"], subtract_ks, explicit_channels
-            )
-            rows.append({"prompt": prompt, "rgb": rgb, "maps": maps})
-
-            report = top_channel_report(x, report_top)
-            top_counts.update(c for c, _ in report)
-            ranked = ", ".join(f"{c}({s:.1f})" for c, s in report)
-            print(f"[qual] {pid + 1}/{len(prompts)}: {prompt[:40]}")
-            print(f"        top-{report_top} channels @L{cfg.target_layer} (id(score)): {ranked}")
+            if single:
+                print(f"[qual] {pid + 1}/{len(prompts)}: {prompt[:40]}")
+            for ly in want:
+                if ly not in state.image_streams:
+                    raise RuntimeError(f"no capture at layer {ly} for prompt {pid}")
+                x = state.image_streams[ly]
+                maps = panel_maps(
+                    x, n_channels, info["h_lat"], info["w_lat"], subtract_ks, explicit_channels
+                )
+                rows_by_layer[ly].append({"prompt": prompt, "rgb": rgb, "maps": maps})
+                report = top_channel_report(x, report_top)
+                counts_by_layer[ly].update(c for c, _ in report)
+                if single:  # per-prompt detail only when not sweeping (else 100s of lines)
+                    ranked = ", ".join(f"{c}({s:.1f})" for c, s in report)
+                    print(f"        top-{report_top} channels @L{ly} (id(score)): {ranked}")
     finally:
         for h in handles:
             h.remove()
 
-    if top_counts:
-        # Channels that recur across prompts are the stable massive ones worth ablating.
-        agg = ", ".join(f"{c}(x{n})" for c, n in top_counts.most_common(report_top))
-        print(f"[qual] most frequent top channels across {len(rows)} prompt(s): {agg}")
+    # Per-layer aggregate: channels that recur across prompts are the stable massive ones
+    # worth ablating — this is the ranking you read to pick --ablate-channels per layer.
+    for ly in want:
+        counts = counts_by_layer[ly]
+        if counts:
+            agg = ", ".join(f"{c}(x{n})" for c, n in counts.most_common(report_top))
+            print(f"[qual] L{ly}: top channels across {len(prompts)} prompt(s): {agg}")
 
-    out_parent = os.path.dirname(out_path)
-    if out_parent:
-        os.makedirs(out_parent, exist_ok=True)  # the per-variant subfolder
-    _save_figure(out_path, rows, cfg.target_layer, n_channels, subtract_ks, explicit_channels)
-    print(f"[qual] wrote {out_path}")
-    return out_path
+    out_paths: list[str] = []
+    for ly in want:
+        out_path = out_override or os.path.join(
+            cfg.output_dir,
+            default_output_name(ly, n_channels, subtract_ks, explicit_channels),
+        )
+        parent = os.path.dirname(out_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)  # the per-variant subfolder
+        _save_figure(out_path, rows_by_layer[ly], ly, n_channels, subtract_ks, explicit_channels)
+        print(f"[qual] wrote {out_path}")
+        out_paths.append(out_path)
+    return out_paths
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -308,6 +354,13 @@ def main(argv: list[str] | None = None) -> None:
         default="",
         help="Explicit channel ids to isolate/remove instead of the top-N, e.g. '154,1446'. "
         "Overrides --channels for the speckle + primary deconfounded columns.",
+    )
+    p.add_argument(
+        "--layers",
+        default="",
+        help="Layers to render: 'all', a list '0,5,10', or empty for the config's "
+        "target_layer. A sweep captures every requested layer in one generation pass and "
+        "writes one file per layer under its channel-variant folder.",
     )
     p.add_argument(
         "--subtract-ks",
@@ -325,25 +378,23 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--out",
         default=None,
-        help="Output PNG (default: <output_dir>/qualitative_L<layer>_...[_sub..].png).",
+        help="Output PNG for a SINGLE layer (default: the foldered per-layer path). "
+        "Invalid when --layers requests more than one layer.",
     )
     args = p.parse_args(argv)
 
     subtract_ks = parse_ks(args.subtract_ks)
     explicit_channels = parse_channels(args.ablate_channels)
     cfg = load_highnorm_config(args.config)
-    out_path = args.out or os.path.join(
-        cfg.output_dir,
-        default_output_name(cfg.target_layer, args.channels, subtract_ks, explicit_channels),
-    )
     run(
         cfg,
         n_channels=args.channels,
-        out_path=out_path,
         limit=args.limit,
         subtract_ks=subtract_ks,
         explicit_channels=explicit_channels,
         report_top=args.report_top,
+        layers_spec=args.layers,
+        out_override=args.out,
     )
 
 
