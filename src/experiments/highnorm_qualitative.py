@@ -24,10 +24,12 @@ Knobs:
   generation pass and written to its own ``qualitative_L<layer>.png`` in the channel folder.
 
 All the norm columns (3 onward: full norm + every "minus ..." column) share ONE color scale
-per row with a colorbar, so they are directly comparable and you can see whether a high-norm
-token dims to background or persists after ablation; independent auto-scaling would re-brighten
-each panel and hide it. Reuses ``highnorm`` (maps) and ``model_utils`` (generate/capture);
-matplotlib/torch are imported lazily so the pure map-builder tests on CPU.
+per row with a colorbar, so they are directly comparable — you can see whether a high-norm
+token disappears (drops to background once the massive channels are removed) or persists. The
+scale is anchored to the post-ablation range so the ablated columns keep full contrast;
+full-norm tokens dominated by the massive channel saturate at the top (colorbar overflow
+arrow). Reuses ``highnorm`` (maps) and ``model_utils`` (generate/capture); matplotlib/torch
+are imported lazily so the pure map-builder tests on CPU.
 
     python -m src.experiments.highnorm_qualitative --config configs/highnorm_tokens.yaml \
         --subtract-ks 5,10,20 --report-top 15
@@ -190,16 +192,23 @@ def norm_columns(maps: dict[str, Any], subtract_ks: list[int] | None = None) -> 
 def shared_norm_scale(
     maps: dict[str, Any], subtract_ks: list[int] | None = None
 ) -> tuple[float, float]:
-    """One (vmin, vmax) spanning ALL norm columns, so they are directly comparable.
+    """One (vmin, vmax) applied to ALL norm columns, so they are directly comparable.
 
-    Removing channels can only lower a token's norm, so ``n_full`` bounds the top of the
-    scale; the min is the smallest value across the fully-ablated map. On this shared scale
-    a high-norm token that is *only* the massive channel drops to background (visibly dims)
-    once that channel is removed, while a genuinely elevated token stays bright — which is
-    the comparison the columns exist to make.
+    Anchored to the **post-ablation** range (the ``n_ex`` + ``subtract`` columns), NOT to
+    the full norm. This keeps the ablated columns at full contrast so you can read whether a
+    high-norm token *disappears* (drops to background once the massive channels are removed)
+    or *persists* (stays bright). Because the full norm is dominated by the massive channel,
+    its outlier tokens exceed this range and saturate at the top of the shared scale — which
+    is exactly the "was high, now gone" contrast the columns exist to show (the colorbar
+    carries an overflow arrow to flag the clipping). Anchoring to the full-norm max instead
+    would crush every ablated column toward black and hide partial persistence.
     """
-    cols = norm_columns(maps, subtract_ks)
-    return float(min(m.min() for m in cols)), float(max(m.max() for m in cols))
+    deconf = norm_columns(maps, subtract_ks)[1:]  # drop n_full; keep n_ex + subtracts
+    lo = float(min(m.min() for m in deconf))
+    hi = float(max(m.max() for m in deconf))
+    if hi <= lo:  # degenerate (e.g. everything ablated to ~0): keep a positive span
+        hi = lo + 1.0
+    return lo, hi
 
 
 # --- figure (matplotlib lazy) -------------------------------------------------
@@ -234,9 +243,10 @@ def _save_figure(
         maps = row["maps"]
         norm_maps = norm_columns(maps, subtract_ks)
         # ONE shared scale across all norm columns (full norm + every ablated norm), so they
-        # are directly comparable: a token that is high-norm only because of the ablated
-        # channel(s) drops to background here (visibly dims), while a genuinely elevated
-        # token stays bright. That side-by-side dim-or-not is the whole point.
+        # are directly comparable. Anchored to the post-ablation range: a token high-norm
+        # only because of the ablated channel(s) drops to background here (disappears), while
+        # a genuinely elevated token stays bright. Full-norm tokens dominated by the massive
+        # channel exceed the range and saturate at the top (colorbar overflow arrow).
         v_lo, v_hi = shared_norm_scale(maps, subtract_ks)
         cells = [
             (row["rgb"], None, None, None),
@@ -258,7 +268,15 @@ def _save_figure(
         # an absolute token-norm value, not just a relative shade.
         if im_norm is not None:
             norm_axes = [axes[r][c] for c in range(2, ncols)]
-            fig.colorbar(im_norm, ax=norm_axes, fraction=0.015, pad=0.01, label="token L2 norm")
+            # extend='max': full-norm massive tokens exceed the post-ablation scale and clip.
+            fig.colorbar(
+                im_norm,
+                ax=norm_axes,
+                fraction=0.015,
+                pad=0.01,
+                label="token L2 norm",
+                extend="max",
+            )
     fig.suptitle(
         f"Massive-activation speckles vs high-norm tokens — layer {layer}\n"
         f"(columns 3+ share one color scale — watch the high-norm tokens dim or persist)",

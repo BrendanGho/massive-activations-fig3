@@ -229,21 +229,33 @@ def test_norm_columns_order_is_full_then_ablated():
     np.testing.assert_array_equal(cols[1], maps["n_ex"])
 
 
-def test_shared_norm_scale_spans_every_norm_column():
-    """Columns 3+ must share one scale so dimming is comparable, not per-panel re-brightened."""
-    x = np.random.default_rng(10).normal(size=(64, 64))
-    x[20, 0] = 500.0  # token 20 high-norm only via channel 0
-    maps = q.panel_maps(x, 1, 8, 8, subtract_ks=[5, 10])
-    lo, hi = q.shared_norm_scale(maps, [5, 10])
+def test_shared_norm_scale_anchors_to_post_ablation_range():
+    """The shared scale must be set by what SURVIVES ablation, not the massive-dominated
+    full norm — so ablated columns keep contrast and disappearance vs persistence is legible."""
+    rng = np.random.default_rng(10)
+    x = rng.normal(size=(64, 64))
+    x[20, 0] = 500.0  # token 20 is high-norm ONLY via channel 0 -> disappears when ablated
+    x[41, 1:40] *= 8.0  # token 41 is broadly elevated -> persists after ablating channel 0
+    maps = q.panel_maps(x, 1, 8, 8, subtract_ks=[5])
+    lo, hi = q.shared_norm_scale(maps, [5])
 
-    cols = q.norm_columns(maps, [5, 10])
-    assert hi == pytest.approx(max(m.max() for m in cols))
-    assert lo == pytest.approx(min(m.min() for m in cols))
-    # removing channels only lowers the norm, so full norm bounds the top of the scale
-    assert hi == pytest.approx(maps["n_full"].max())
-    # and on that shared scale, ablating channel 0 drops token 20 far below the top
-    peak = (20 // 8, 20 % 8)
-    assert maps["n_ex"][peak] < 0.3 * hi, "the ablated token should dim on the shared scale"
+    deconf = q.norm_columns(maps, [5])[1:]  # n_ex + subtract (exclude full norm)
+    assert hi == pytest.approx(max(m.max() for m in deconf)), "vmax set by surviving norm"
+    assert lo == pytest.approx(min(m.min() for m in deconf))
+    # full norm's massive token exceeds the scale (it saturates, flagged by the overflow arrow)
+    assert maps["n_full"].max() > hi
+    # the persistent token anchors the top; the disappeared token drops well below it
+    pk_dis, pk_per = (20 // 8, 20 % 8), (41 // 8, 41 % 8)
+    assert maps["n_ex"][pk_per] == pytest.approx(hi)
+    assert maps["n_ex"][pk_dis] < 0.6 * hi
+
+
+def test_shared_norm_scale_positive_span_when_all_ablated():
+    x = np.zeros((64, 8))
+    x[:, 0] = 5.0  # only channel 0 has energy; ablating it leaves everything at 0
+    maps = q.panel_maps(x, 1, 8, 8)
+    lo, hi = q.shared_norm_scale(maps)
+    assert hi > lo, "degenerate all-zero ablation must not collapse vmin==vmax"
 
 
 def test_save_figure_renders_all_columns(tmp_path):

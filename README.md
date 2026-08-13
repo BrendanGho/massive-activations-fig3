@@ -192,9 +192,13 @@ top channel). The full-norm panel is a carbon copy of the speckles (that's the c
 below, made visible); whether the last panel still lights up at those spots is the whole
 question. `--subtract-ks 5,10,20` adds one further "norm minus top-k" column per k, to
 watch the high-norm token fade (or persist) as more massive channels are peeled off. All the
-norm columns (3 onward: full norm + every "minus ..." column) share **one** color scale per
-row with a colorbar, so they are directly comparable — a token that is high-norm only because
-of the ablated channel dims to background, while a genuinely elevated token stays bright.
+norm columns (3 onward: full norm + every "norm minus ..." column) share **one** color scale
+per row with a colorbar, so they are directly comparable — you can see whether subtracting the
+massive channels makes the high-norm tokens disappear. The scale is anchored to the
+post-ablation range so the ablated columns keep full contrast: a token high-norm only because
+of the ablated channel drops to background (disappears), while a genuinely elevated token
+stays bright; full-norm tokens dominated by the massive channel saturate at the top (colorbar
+overflow arrow).
 `--report-top 15` prints the top channels (by mean|abs|) per prompt plus a cross-prompt
 aggregate, and `--ablate-channels 154,1446` isolates/removes those *explicit* channels
 instead of the top-N — read the printed ranking, then ablate the ones you care about.
