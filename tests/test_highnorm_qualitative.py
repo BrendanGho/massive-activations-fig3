@@ -219,6 +219,12 @@ def test_resolve_layers_rejects_out_of_range():
         q.resolve_layers("0,99", list(range(28)), target_layer=0)
 
 
+def test_resolve_layers_validates_default_target_layer():
+    # the empty/default path must validate too (not just the explicit-list path)
+    with pytest.raises(ValueError, match="not in model"):
+        q.resolve_layers("", list(range(28)), target_layer=99)
+
+
 def test_norm_columns_order_is_full_then_ablated():
     x = np.random.default_rng(9).normal(size=(64, 64))
     x[20, 0] = 500.0

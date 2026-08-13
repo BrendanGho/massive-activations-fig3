@@ -241,7 +241,16 @@ def _save_figure(
     ]
     ncols = len(titles)
     n = len(rows)
-    fig, axes = plt.subplots(n, ncols, figsize=(3.0 * ncols, 3.1 * n), squeeze=False)
+    # An extra thin trailing column holds each row's colorbar, so every image panel keeps
+    # equal width and rows stay aligned (a colorbar stolen from the norm axes would shrink
+    # only those, breaking the side-by-side comparison the figure exists for).
+    fig, axes = plt.subplots(
+        n,
+        ncols + 1,
+        figsize=(3.0 * ncols + 0.6, 3.1 * n),
+        squeeze=False,
+        gridspec_kw={"width_ratios": [1.0] * ncols + [0.08]},
+    )
     for r, row in enumerate(rows):
         maps = row["maps"]
         norm_maps = norm_columns(maps, subtract_ks)
@@ -266,11 +275,12 @@ def _save_figure(
             if r == 0:
                 ax.set_title(titles[c], fontsize=10)
         axes[r][0].set_ylabel(row["prompt"][:32], fontsize=8)
-        # One colorbar per row spanning the norm columns, so "dims or not" is readable as
-        # an absolute token-norm value, not just a relative shade.
+        # Per-row colorbar in its dedicated column (each row has its own absolute scale).
+        cbar_ax = axes[r][ncols]
         if im_norm is not None:
-            norm_axes = [axes[r][c] for c in range(2, ncols)]
-            fig.colorbar(im_norm, ax=norm_axes, fraction=0.015, pad=0.01, label="token L2 norm")
+            fig.colorbar(im_norm, cax=cbar_ax, label="token L2 norm")
+        else:
+            cbar_ax.axis("off")
     fig.suptitle(
         f"Massive-activation speckles vs high-norm tokens — layer {layer}\n"
         f"(columns 3+ share one color scale — watch the high-norm tokens dim or persist)",
@@ -286,13 +296,14 @@ def _save_figure(
 def resolve_layers(spec: str | None, all_ids: list[int], target_layer: int) -> list[int]:
     """Which layers to render. ``""``/None -> [target_layer]; ``"all"`` -> every block;
     ``"0,5,10"`` -> those (validated against the model's block ids)."""
-    if not spec or not str(spec).strip():
-        return [int(target_layer)]
-    s = str(spec).strip().lower()
-    if s == "all":
-        return list(all_ids)
-    want = sorted({int(p) for p in s.split(",") if p.strip()})
     available = set(all_ids)
+    if not spec or not str(spec).strip():
+        want = [int(target_layer)]  # default path is validated too, with the same message
+    else:
+        s = str(spec).strip().lower()
+        if s == "all":
+            return list(all_ids)
+        want = sorted({int(p) for p in s.split(",") if p.strip()})
     missing = [ly for ly in want if ly not in available]
     if missing:
         raise ValueError(f"requested layers not in model (available 0..{max(all_ids)}): {missing}")

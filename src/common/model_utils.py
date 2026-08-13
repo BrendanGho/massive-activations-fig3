@@ -141,6 +141,7 @@ def select_layers(blocks: list[BlockRef], layers_cfg: Any) -> list[BlockRef]:
 class CaptureState:
     n_image: int | None = None
     n_text: int | None = None
+    n_batch: int | None = None  # batch size of the transformer forward; >1 => CFG is active
     forward_count: int = 0
     image_streams: dict[int, np.ndarray] = field(default_factory=dict)
     # Optional multi-timestep capture: denoising-step indices to snapshot. The last-step
@@ -153,6 +154,7 @@ class CaptureState:
     def reset(self) -> None:
         self.n_image = None
         self.n_text = None
+        self.n_batch = None
         self.forward_count = 0
         self.image_streams = {}
         self.step_streams = {}  # capture_steps (the request) survives reset
@@ -163,10 +165,16 @@ def _extract_image_stream(output: Any, n_image: int) -> np.ndarray | None:
 
     Chooses the tensor whose seq-len == N_I (image-only block); else the last
     N_I tokens of a longer [text, image] sequence (single-stream block). Takes the
-    LAST batch element: under classifier-free guidance the batch is [uncond, cond]
-    (e.g. PixArt), and the conditional/text-guided branch is the one that matches the
-    returned image. FLUX runs batch-1 (guidance is an embedding, not a doubled batch),
-    so -1 is identical to 0 there.
+    LAST batch element: diffusers batches classifier-free guidance as [uncond, cond],
+    so -1 is the conditional branch. FLUX runs batch-1 (guidance is an embedding, not a
+    doubled batch), so -1 is identical to 0 there.
+
+    Caveat for real-CFG models (PixArt): we capture the *conditional forward*, which is a
+    property of the network on the text-conditioned input — the right object for studying
+    massive activations. It is NOT the guidance-extrapolated latent (uncond + s*(cond-uncond))
+    that actually produced the rendered image. Verify CFG is active via ``CaptureState.n_batch``
+    (== 2). This assumes the diffusers [uncond, cond] ordering; a pipeline that batches CFG
+    differently would need this revisited.
     """
     import torch
 
@@ -211,11 +219,21 @@ def register_capture_hooks(transformer: Any, blocks: list[BlockRef], state: Capt
         if enc is None and len(args) > 1:
             enc = args[1]
         if hidden is not None and hasattr(hidden, "shape"):
+            state.n_batch = int(hidden.shape[0])
             if hidden.dim() == 4:
                 # Conv-latent input (B, C, H, W), e.g. PixArt/DiT: the transformer
                 # patchifies internally, so N_I = (H/patch)*(W/patch). FLUX instead
                 # passes an already-packed (B, N_I, D) sequence, handled by the else.
-                ps = int(getattr(getattr(module, "config", None), "patch_size", 1) or 1)
+                # Fail loud if patch_size is unavailable: guessing it silently yields a
+                # wrong token count and a confusing "no capture" error downstream.
+                ps = getattr(getattr(module, "config", None), "patch_size", None)
+                if not ps:
+                    raise RuntimeError(
+                        "4D transformer input but transformer.config.patch_size is missing; "
+                        "cannot infer the image-token count. Add patch_size handling for this "
+                        "model before capturing."
+                    )
+                ps = int(ps)
                 state.n_image = (hidden.shape[-2] // ps) * (hidden.shape[-1] // ps)
             else:
                 state.n_image = int(hidden.shape[1])
