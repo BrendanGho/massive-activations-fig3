@@ -144,6 +144,10 @@ class CaptureState:
     n_batch: int | None = None  # batch size of the transformer forward; >1 => CFG is active
     forward_count: int = 0
     image_streams: dict[int, np.ndarray] = field(default_factory=dict)
+    # Optional text-stream capture (opt-in via register_capture_hooks(capture_text=True) for
+    # FLUX's per-DiT-layer text tokens, or register_text_encoder_hooks for a T5 text encoder).
+    # Keyed by layer id, [N_text, D], last forward wins — same convention as image_streams.
+    text_streams: dict[int, np.ndarray] = field(default_factory=dict)
     # Optional multi-timestep capture: denoising-step indices to snapshot. The last-step
     # `image_streams` buffer is always kept regardless; `step_streams` is keyed by
     # (step, layer_id). One transformer forward == one denoising step for FLUX
@@ -157,6 +161,7 @@ class CaptureState:
         self.n_batch = None
         self.forward_count = 0
         self.image_streams = {}
+        self.text_streams = {}
         self.step_streams = {}  # capture_steps (the request) survives reset
 
 
@@ -204,10 +209,57 @@ def _extract_image_stream(output: Any, n_image: int) -> np.ndarray | None:
     return chosen[-1].detach().float().cpu().numpy()
 
 
-def register_capture_hooks(transformer: Any, blocks: list[BlockRef], state: CaptureState):
-    """Register the pre-hook (derives N_I) + per-block hooks (capture image stream).
+def _extract_text_stream(output: Any, n_text: int, n_image: int) -> np.ndarray | None:
+    """Pull the [N_text, D] text slice from a FLUX block's output.
 
-    Returns a list of hook handles; call ``.remove()`` on each when done.
+    Mirror of ``_extract_image_stream`` for the complementary (text) tokens. FLUX blocks
+    return a ``(text[N_text], image[N_image])`` tuple, so we pick the tensor whose seq-len
+    == ``n_text`` (== ``out[0]`` in the reference). If instead a single concatenated
+    ``[text, image]`` sequence is returned, text is the FIRST ``n_text`` tokens (image is
+    the last ``n_image``, which ``_extract_image_stream`` takes). Returns None when there is
+    no text slice (e.g. an image-only PixArt DiT block). Last batch element (CFG conditional).
+    """
+    import torch
+
+    if n_text is None or n_text <= 0:
+        return None
+    if isinstance(output, torch.Tensor):
+        candidates = [output]
+    elif isinstance(output, (tuple, list)):
+        candidates = [t for t in output if isinstance(t, torch.Tensor)]
+    else:
+        return None
+
+    exact = None
+    concat = None
+    for t in candidates:
+        if t.dim() != 3:
+            continue
+        seq = t.shape[1]
+        if seq == n_text:
+            exact = t
+            break
+        if seq == n_text + n_image and concat is None:
+            concat = t
+    if exact is not None:
+        return exact[-1].detach().float().cpu().numpy()
+    if concat is not None:
+        return concat[:, :n_text, :][-1].detach().float().cpu().numpy()
+    return None
+
+
+def register_capture_hooks(
+    transformer: Any,
+    blocks: list[BlockRef],
+    state: CaptureState,
+    capture_text: bool = False,
+):
+    """Register the pre-hook (derives N_I / N_text) + per-block hooks (capture image stream).
+
+    ``capture_text=True`` additionally stores the per-block text slice in
+    ``state.text_streams`` (FLUX: the ``out[0]`` text tensor of each block). No-op for
+    image-only blocks (e.g. PixArt DiT), whose text stream lives in the T5 encoder instead
+    (see ``register_text_encoder_hooks``). Returns a list of hook handles; ``.remove()`` each.
     """
     handles = []
 
@@ -253,11 +305,58 @@ def register_capture_hooks(transformer: Any, blocks: list[BlockRef], state: Capt
                 step = state.forward_count - 1  # pre-hook already counted this forward
                 if state.capture_steps is not None and step in state.capture_steps:
                     state.step_streams[(step, layer_id)] = stream
+            if capture_text and state.n_text:
+                tstream = _extract_text_stream(output, state.n_text, state.n_image)
+                if tstream is not None:
+                    state.text_streams[layer_id] = tstream  # overwrite -> last step wins
 
         return hook
 
     for b in blocks:
         handles.append(b.module.register_forward_hook(make_hook(b.layer_id)))
+    return handles
+
+
+def find_text_encoder_layers(pipe: Any) -> list[Any]:
+    """Return the per-layer modules of the pipe's T5 text encoder, in order.
+
+    PixArt's diffusion transformer has no text residual stream (text enters via
+    cross-attention as a frozen T5 encoding), so the real per-layer text stream lives inside
+    the T5 encoder. Prefers ``text_encoder`` (PixArt's T5); falls back to ``text_encoder_2``
+    (FLUX's T5). Each returned module is a T5 encoder block whose output[0] is [B, N_text, D].
+    """
+    for attr in ("text_encoder", "text_encoder_2"):
+        enc = getattr(pipe, attr, None)
+        block = getattr(getattr(enc, "encoder", None), "block", None)
+        if block is not None and len(block) > 0:
+            return list(block)
+    raise RuntimeError(
+        "Could not locate a T5 encoder (pipe.text_encoder[.encoder.block]); "
+        "cannot capture the text-encoder stream for this pipeline."
+    )
+
+
+def register_text_encoder_hooks(pipe: Any, state: CaptureState):
+    """Hook each T5 text-encoder layer to capture the per-layer TEXT stream.
+
+    This is the correct PixArt text stream (the DiT exposes none). The T5 encoder runs once
+    per prompt encoding, so this is a per-encoder-layer snapshot (not per denoising step).
+    Stores ``[N_text, D]`` in ``state.text_streams`` keyed by encoder-layer index, last
+    forward wins (under CFG the encoder may run for the negative prompt too; the conditional
+    call overwrites). Returns handles; ``.remove()`` each when done.
+    """
+    handles = []
+
+    def make_hook(layer_id: int):
+        def hook(_module, _inp, output):
+            t = output[0] if isinstance(output, (tuple, list)) else output
+            if hasattr(t, "dim") and t.dim() == 3:
+                state.text_streams[layer_id] = t[-1].detach().float().cpu().numpy()
+
+        return hook
+
+    for i, layer in enumerate(find_text_encoder_layers(pipe)):
+        handles.append(layer.register_forward_hook(make_hook(i)))
     return handles
 
 

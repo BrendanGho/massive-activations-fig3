@@ -257,6 +257,35 @@ mode from a mere long tail.
 python -m src.experiments.highnorm_tokens --config configs/highnorm_tokens.yaml
 ```
 
+## Part 4 — text stream (high-norm tokens & massive channels)
+
+`src/experiments/text_stream_qualitative.py` (Colab Part 4). Everything above analyzes the
+**image** stream; this points the *same channel lens* (rank channels by mean|abs|, per-token
+L2 norm, post-hoc "norm minus the massive channels") at the **text** tokens. Text is a 1-D
+sequence, so outputs are per-token-position plots (norm & high-norm positions vs position,
+with the prompt/EOS/padding boundary and token identities), not spatial heatmaps. Motivation:
+in LLMs the massive activations live on text "sink" tokens (first token / EOS / padding); this
+asks whether that holds here, and whether the massive channels are **shared with the image
+stream** (channel-overlap Jaccard, per prompt/layer).
+
+**The text source differs by architecture, handled automatically (`--text-source auto`):**
+- **FLUX (MMDiT)** — text is a live per-DiT-layer residual stream. Each block returns a
+  `(text[512], image[4096])` tuple; we capture `out[0]` (`register_capture_hooks(capture_text=True)`,
+  `_extract_text_stream`).
+- **PixArt (cross-attn DiT)** — the DiT has **no** text stream (text is a frozen T5 encoding
+  used via cross-attention). The real text stream is inside the **T5 encoder**, captured per T5
+  layer (`register_text_encoder_hooks`). The reference repo's PixArt "text" hook is a **bug** —
+  it hooks the image-only DiT blocks and slices the last `text_len` positions, capturing the
+  bottom-right *image* corner, not text — so we use T5 instead.
+
+Outputs are foldered by source: `<output_dir>/text_{dit|t5}/text_L<layer>_ch<base_k>.png`.
+The numeric core is `src/common/highnorm.py`, reused unchanged; only the capture (text slice /
+T5 hook) and the 1-D visualization are new.
+
+```bash
+python -m src.experiments.text_stream_qualitative --config configs/highnorm_tokens.yaml --layers all
+```
+
 ## Colab storage
 
 Point both dirs at a Drive mount so writes survive a session ending mid-run (no code change):
