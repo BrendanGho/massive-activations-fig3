@@ -3,7 +3,7 @@
 The simplest possible version of the Part 3 question — no statistics, no CSV, no nulls.
 For each prompt it renders one row:
 
-    generated | isolated channel(s) (speckles) | high-norm (full) | high-norm (minus those)
+    generated | isolated channel(s) | high-norm tokens | high-norm tokens, channel(s) ablated
 
 The two high-norm panels are the whole point of looking. "Full" is the token L2 norm; it
 will look like a carbon copy of the speckle panel, because a token with a massive value in
@@ -232,12 +232,15 @@ def _save_figure(
 
     subtract_ks = subtract_ks or []
     label = _primary_label(n_channels, explicit_channels)
+    # No parenthetical asides and no per-row prompt label: the columns are named for what
+    # they show, and the ablated columns say so in words ("... ablated") rather than in
+    # terms of the arithmetic that produced them.
     titles = [
         "generated",
-        f"isolated {label}\n(the speckles)",
-        "high-norm tokens\n(full norm — the confound)",
-        f"high-norm tokens\n(norm minus {label})",
-        *(f"high-norm tokens\n(norm minus top-{k})" for k in subtract_ks),
+        f"isolated {label}",
+        "high-norm tokens",
+        f"high-norm tokens\n{label} ablated",
+        *(f"high-norm tokens\ntop-{k} channels ablated" for k in subtract_ks),
     ]
     ncols = len(titles)
     n = len(rows)
@@ -274,18 +277,13 @@ def _save_figure(
             ax.set_yticks([])
             if r == 0:
                 ax.set_title(titles[c], fontsize=10)
-        axes[r][0].set_ylabel(row["prompt"][:32], fontsize=8)
         # Per-row colorbar in its dedicated column (each row has its own absolute scale).
         cbar_ax = axes[r][ncols]
         if im_norm is not None:
             fig.colorbar(im_norm, cax=cbar_ax, label="token L2 norm")
         else:
             cbar_ax.axis("off")
-    fig.suptitle(
-        f"Massive-activation speckles vs high-norm tokens — layer {layer}\n"
-        f"(columns 3+ share one color scale — watch the high-norm tokens dim or persist)",
-        fontsize=11,
-    )
+    fig.suptitle(f"Layer {layer}", fontsize=13)
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 

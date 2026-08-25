@@ -186,13 +186,15 @@ Darcet et al. ([arXiv:2309.16588](https://arxiv.org/abs/2309.16588))? Where Part
 channel-space only, this is a **token-space** question.
 
 **Start here — the qualitative look.** `src/experiments/highnorm_qualitative.py` is the
-simplest version: no statistics, one row per prompt — generated image | isolated top-1
-channel (the speckles) | high-norm tokens (full norm) | high-norm tokens (norm minus the
-top channel). The full-norm panel is a carbon copy of the speckles (that's the confound
-below, made visible); whether the last panel still lights up at those spots is the whole
-question. `--subtract-ks 5,10,20` adds one further "norm minus top-k" column per k, to
-watch the high-norm token fade (or persist) as more massive channels are peeled off. All the
-norm columns (3 onward: full norm + every "norm minus ..." column) share **one absolute**
+simplest version: no statistics, one row per prompt — `generated` | `isolated top-1 channel`
+(the speckles) | `high-norm tokens` (the full L2 norm) | `high-norm tokens, top-1 channel
+ablated` (that channel deleted from the norm). The full-norm panel is a carbon copy of the
+speckles (that's the confound below, made visible); whether the last panel still lights up at
+those spots is the whole question. `--subtract-ks 5,10,20` adds one further `top-k channels
+ablated` column per k, to watch the high-norm token fade (or persist) as more massive channels
+are peeled off. The figure is titled `Layer <n>` and carries no per-row prompt label — the
+prompts are in the config, and stripping them keeps the panels the same width. All the
+norm columns (3 onward: full norm + every ablated column) share **one absolute**
 color scale per row (spanning the full-norm range, no clipping) with a colorbar, so a color
 means the same token norm in every column and they are directly comparable pixel for pixel.
 That is what lets you see whether subtracting the massive channels makes a high-norm token
