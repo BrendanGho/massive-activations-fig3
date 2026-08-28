@@ -67,6 +67,25 @@ def test_analyze_text_layer_channel_overlap_with_image():
     assert ts.analyze_text_layer(x, 1, 0.1)["channel_overlap_with_image"] is None
 
 
+def test_describe_high_norm_tokens_reports_component_attribution():
+    x = _planted_text(sink_pos=0, sink_ch=2)
+    a = ts.analyze_text_layer(x, base_k=1, outlier_frac=0.1)
+    desc = ts.describe_high_norm_tokens(a, [("prompt", "▁hello")], top_n=1)
+
+    assert len(desc) == 1
+    assert desc[0]["position"] == 0
+    assert desc[0]["kind"] == "prompt"
+    assert desc[0]["token"] == "hello"
+    assert desc[0]["ratio_to_median"] > 10
+    assert desc[0]["deconfounded_norm"] < 0.2 * desc[0]["full_norm"]
+
+
+def test_describe_high_norm_tokens_rejects_nonpositive_top_n():
+    a = ts.analyze_text_layer(_planted_text(), base_k=1, outlier_frac=0.1)
+    with pytest.raises(ValueError, match="top_n"):
+        ts.describe_high_norm_tokens(a, top_n=0)
+
+
 # --- output_name (pure) -------------------------------------------------------
 
 

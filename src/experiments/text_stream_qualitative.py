@@ -94,6 +94,53 @@ def analyze_text_layer(
     }
 
 
+def clean_token_label(token: Any) -> str:
+    """Make a tokenizer token readable in a compact plot/readout label."""
+    text = str(token).replace("▁", " ").strip()
+    return text if text else "<space>"
+
+
+def describe_high_norm_tokens(
+    analysis: dict[str, Any],
+    token_labels: list[tuple[str, str]] | None = None,
+    top_n: int = 3,
+) -> list[dict[str, Any]]:
+    """Describe the largest full-norm text positions for one analyzed layer.
+
+    This is deliberately a *component-attribution* readout, not a causal intervention:
+    ``deconfounded_norm`` is the same token vector with the selected channels excluded from
+    its norm.  Keeping it pure makes the printed experimental summary straightforward to test.
+    """
+    if top_n < 1:
+        raise ValueError(f"top_n must be positive, got {top_n}")
+    norms = np.asarray(analysis["norms"], dtype=np.float64).ravel()
+    n_ex = np.asarray(analysis["n_ex"], dtype=np.float64).ravel()
+    if norms.shape != n_ex.shape:
+        raise ValueError(f"norms/n_ex shape mismatch: {norms.shape} vs {n_ex.shape}")
+    if norms.size == 0:
+        return []
+    median = float(np.median(norms))
+    order = np.argsort(-norms, kind="stable")[: min(int(top_n), norms.size)]
+    rows: list[dict[str, Any]] = []
+    for pos in order:
+        kind, token = ("unknown", "<unavailable>")
+        if token_labels is not None and int(pos) < len(token_labels):
+            kind, token = token_labels[int(pos)]
+        full = float(norms[pos])
+        rows.append(
+            {
+                "position": int(pos),
+                "kind": str(kind),
+                "token": clean_token_label(token),
+                "full_norm": full,
+                "median_norm": median,
+                "ratio_to_median": float(full / median) if median > 0 else float("inf"),
+                "deconfounded_norm": float(n_ex[pos]),
+            }
+        )
+    return rows
+
+
 # --- figure (matplotlib lazy) -------------------------------------------------
 
 
@@ -103,8 +150,7 @@ def _save_text_figure(
     layer: int,
     base_k: int,
 ) -> None:
-    """One row per prompt: per-token-position L2 norm (full vs minus massive channels),
-    high-norm positions marked, prompt/padding boundary drawn, top tokens annotated."""
+    """One row per prompt: full/deconfounded norms and the top decoded positions."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -117,24 +163,48 @@ def _save_text_figure(
         a = row["analysis"]
         norms, n_ex = a["norms"], a["n_ex"]
         pos = np.arange(norms.size)
-        ax.plot(pos, norms, color="#c0392b", lw=1.0, label="full norm")
+        positive = np.concatenate((norms[norms > 0], n_ex[n_ex > 0]))
+        floor = float(positive.min() * 0.25) if positive.size else 1e-12
+        shown_norms = np.maximum(norms, floor)
+        shown_n_ex = np.maximum(n_ex, floor)
+        ax.plot(pos, shown_norms, color="#c0392b", lw=1.0, label="full norm")
         ax.plot(
-            pos, n_ex, color="#2c3e50", lw=1.0, alpha=0.8, label=f"minus top-{base_k} massive ch"
+            pos,
+            shown_n_ex,
+            color="#2c3e50",
+            lw=1.0,
+            alpha=0.8,
+            label=f"excluding top-{base_k} massive ch",
         )
         hi = a["high_norm_positions"]
-        ax.scatter(hi, norms[hi], s=18, color="#e67e22", zorder=3, label="high-norm token")
+        labels = row.get("token_labels") or []
+        colors = {"prompt": "#e67e22", "eos": "#8e44ad", "pad": "#7f8c8d", "unknown": "#34495e"}
+        for kind in ("prompt", "eos", "pad", "unknown"):
+            kind_pos = [
+                int(p)
+                for p in hi
+                if (labels[int(p)][0] if int(p) < len(labels) else "unknown") == kind
+            ]
+            if kind_pos:
+                ax.scatter(
+                    kind_pos,
+                    shown_norms[kind_pos],
+                    s=18,
+                    color=colors[kind],
+                    zorder=3,
+                    label=f"high-norm {kind}",
+                )
         # prompt / padding boundary
         n_real = row.get("n_real_tokens")
         if n_real:
             ax.axvline(n_real - 0.5, ls=":", c="gray", lw=1)
         # annotate the top few high-norm positions with their decoded token
-        labels = row.get("token_labels") or []
-        order = sorted(hi, key=lambda p: -norms[p])[:5]
-        for p in order:
-            tok = labels[p][1] if p < len(labels) else ""
+        order = describe_high_norm_tokens(a, labels, top_n=3)
+        for item in order:
+            p = item["position"]
             ax.annotate(
-                f"{p}:{tok}",
-                (p, norms[p]),
+                f"{p}: {item['kind']} {item['token']}",
+                (p, shown_norms[p]),
                 fontsize=7,
                 xytext=(0, 4),
                 textcoords="offset points",
@@ -144,11 +214,19 @@ def _save_text_figure(
         ovs = f", ch-overlap w/ image={ov:.2f}" if ov is not None else ""
         ax.set_ylabel(row["prompt"][:24], fontsize=8)
         ax.set_title(f"massive ch {a['massive_channels']}{ovs}", fontsize=8)
+        ax.set_yscale("log")
         if r == 0:
             ax.legend(fontsize=7, loc="upper right")
         if r == n - 1:
             ax.set_xlabel("text token position (prompt … EOS … padding)")
     fig.suptitle(f"Text stream — high-norm tokens & massive channels — layer {layer}", fontsize=11)
+    fig.text(
+        0.5,
+        0.01,
+        "Log scale exposes both the largest token norms and their component-attribution norm after excluding massive channels.",
+        ha="center",
+        fontsize=8,
+    )
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -173,13 +251,20 @@ def _decode_labels(pipe, prompt: str, n_text: int, source: str):
     tok = tok or getattr(pipe, "tokenizer", None)
     if tok is None:
         return None, None
-    ids = tok(prompt, return_tensors="pt", truncation=True).input_ids[0].tolist()
-    kinds = classify_token_positions(
-        ids, n_text, getattr(tok, "eos_token_id", None), getattr(tok, "pad_token_id", None)
-    )
-    strs = tok.convert_ids_to_tokens(ids)
-    labels = [(kinds[i], strs[i] if i < len(strs) else "<pad>") for i in range(n_text)]
-    return labels, len(ids)
+    try:
+        ids = tok(prompt, return_tensors="pt", truncation=True).input_ids[0].tolist()
+        kinds = classify_token_positions(
+            ids, n_text, getattr(tok, "eos_token_id", None), getattr(tok, "pad_token_id", None)
+        )
+        strs = tok.convert_ids_to_tokens(ids)
+        labels = [
+            (kinds[i], clean_token_label(strs[i]) if i < len(strs) else "<pad>")
+            for i in range(n_text)
+        ]
+        return labels, len(ids)
+    except Exception as exc:
+        print(f"[text] token labels unavailable: {type(exc).__name__}: {exc}")
+        return [("unknown", "<unavailable>") for _ in range(n_text)], None
 
 
 def run(cfg, limit: int | None, layers_spec: str | None, text_source: str | None) -> list[str]:
@@ -232,10 +317,16 @@ def run(cfg, limit: int | None, layers_spec: str | None, text_source: str | None
                         "n_real_tokens": n_real,
                     }
                 )
-                top = ", ".join(str(p) for p in a["high_norm_positions"][:8])
+                readout = describe_high_norm_tokens(a, labels, top_n=3)
+                top = "; ".join(
+                    f"pos {x['position']} ({x['kind']} {x['token']}): "
+                    f"norm {x['full_norm']:.4g}, {x['ratio_to_median']:.3g}x median, "
+                    f"excluding massive ch -> {x['deconfounded_norm']:.4g}"
+                    for x in readout
+                )
                 print(
                     f"[text] prompt {pid + 1} {text_key} {ly}: massive ch {a['massive_channels']}"
-                    f" | high-norm text positions [{top}]"
+                    f" | top high-norm tokens: {top}"
                     + (
                         f" | ch-overlap w/image {a['channel_overlap_with_image']:.2f}"
                         if a["channel_overlap_with_image"] is not None

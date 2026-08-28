@@ -262,11 +262,12 @@ python -m src.experiments.highnorm_tokens --config configs/highnorm_tokens.yaml
 `src/experiments/text_stream_qualitative.py` (Colab Part 4). Everything above analyzes the
 **image** stream; this points the *same channel lens* (rank channels by mean|abs|, per-token
 L2 norm, post-hoc "norm minus the massive channels") at the **text** tokens. Text is a 1-D
-sequence, so outputs are per-token-position plots (norm & high-norm positions vs position,
-with the prompt/EOS/padding boundary and token identities), not spatial heatmaps. Motivation:
-in LLMs the massive activations live on text "sink" tokens (first token / EOS / padding); this
-asks whether that holds here, and whether the massive channels are **shared with the image
-stream** (channel-overlap Jaccard, per prompt/layer).
+sequence, so outputs are log-scale per-token-position plots (full norm and the norm after
+excluding massive channels, with prompt/EOS/padding identities), not spatial heatmaps. It asks
+which text positions have unusually large norms, whether the selected channels account for them,
+and whether those channels are **shared with the image stream** (channel-overlap Jaccard, per
+prompt/layer). Excluding channels is post-hoc component attribution, not a causal forward-pass
+ablation.
 
 **The text source differs by architecture, handled automatically (`--text-source auto`):**
 - **FLUX (MMDiT)** — text is a live per-DiT-layer residual stream. Each block returns a
