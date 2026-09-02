@@ -46,7 +46,7 @@ models:
   - key: pixart-sigma
     label: PixArt-Sigma
     model_ckpt: PixArt-alpha/PixArt-Sigma-XL-2-1024-MS
-    target_layer: 27        # last DiT block
+    target_layer: 18        # same block index as the FLUX rows
     layers: all
     ablate_channels: [293]
     num_denoising_steps: 20

@@ -128,7 +128,7 @@ def test_shipped_config_is_valid_and_has_the_three_rows(tmp_path):
 
     assert [m.key for m in cfg.models] == ["flux-schnell", "flux1-dev", "pixart-sigma"]
     assert [m.ablate_channels for m in cfg.models] == [[154], [154], [293]]
-    assert [m.target_layer for m in cfg.models] == [18, 18, 27]
+    assert [m.target_layer for m in cfg.models] == [18, 18, 18]
 
 
 # --- per-row column titles ----------------------------------------------------
