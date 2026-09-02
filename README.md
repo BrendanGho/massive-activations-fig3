@@ -212,6 +212,34 @@ its own folder — built for sweeping all layers × a few channel sets. (Capturi
 holds ~`n_layers × N × D` of CPU RAM at peak; pass a layer subset if memory-constrained.)
 `python -m src.experiments.highnorm_qualitative --config configs/highnorm_tokens.yaml --subtract-ks 5,10,20 --report-top 15`
 
+**Cross-model version — one row per model, its own ablated channel.**
+`src/experiments/highnorm_crossmodel.py` + `configs/highnorm_crossmodel.yaml` swaps the row
+axis from prompts to **models**: same prompt, same seed, one row per model, four columns —
+`generated` | `isolated channel C` | `high-norm tokens` | `high-norm tokens, C ablated` — with
+`C` set **per model**, because massive-channel ids are per model *and* per layer (FLUX 154,
+PixArt-Sigma 293). Every row therefore carries its **own** column titles naming its own
+channel; a single header row would mislabel every row but the first. The row label on the
+left names the model and the layer it was probed at. The absolute norm scale (and its
+colorbar) is **per row, never pooled across rows** — different models have different widths
+`D` and different activation magnitudes, so a shared cross-model scale would say nothing.
+
+Capture and figure are separate stages joined by a cache, because the three models don't fit
+in memory together and one of them (FLUX.1-dev) is gated: each model is loaded **alone**,
+hooked on every requested layer in a single generation pass, written to
+`<output_dir>/cache/<key>/L<layer>.npz`, then freed. Re-runs reuse the cache, so a row that
+already ran costs nothing and the figure can be reassembled — different layer, different
+channels — without a GPU. A row missing from the cache is reported and omitted rather than
+aborting the figure, so a gated or OOM model can be filled in later. Flags: `--only
+pixart-sigma` captures just that row (others still come from cache), `--refresh` regenerates
+over the cache, `--channels 154` overrides the ablated ids for the selected rows, and
+`--sweep-layers` uses each row's `layers:` spec to write one figure per layer **common to all
+rows** (FLUX 0–56 vs PixArt 0–27 → figures for 0–27; the rest are reported, not silently
+dropped; hooking every FLUX block holds ~3 GB of CPU RAM at peak — `n_layers × N_I × D`
+float32 — so pass a layer subset if memory-constrained). Leave a row's `ablate_channels: []`
+to isolate that layer's top-`n_channels` channel instead and have the titles report which one
+it picked.
+`python -m src.experiments.highnorm_crossmodel --config configs/highnorm_crossmodel.yaml`
+
 Model scope: FLUX.1 (schnell/dev) and FLUX.2-klein, plus **PixArt-Sigma** (a DiT that feeds
 the transformer a 4D conv latent and uses real classifier-free guidance — the capture hooks
 handle both; see `model_utils.register_capture_hooks`). Pick the model in the Colab

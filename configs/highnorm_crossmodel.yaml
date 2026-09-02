@@ -1,0 +1,53 @@
+# Part 3, cross-model: one row per model, each ablating ITS OWN massive channel.
+#
+# Loaded by src/experiments/highnorm_crossmodel.py. Same prompt and seed in every row, so
+# the rows are directly comparable; the ablated channel is per model, because massive
+# channel ids are per model and per layer.
+#
+#   python -m src.experiments.highnorm_crossmodel --config configs/highnorm_crossmodel.yaml
+#
+# Don't know the channel id for a model/layer yet? Leave `ablate_channels: []` and it uses
+# that layer's top-`n_channels` channel and prints which one it picked, or read the ranking
+# from a highnorm_qualitative run (--report-top 15).
+
+output_dir:                 # where crossmodel.png and cache/ land (required)
+prompt: a red bicycle leaning against a brick wall
+
+# --- generation (shared by every row) -----------------------------------------
+resolution: 1024
+dtype: bf16                 # bf16 | fp16 | fp32  (T4 -> fp16)
+device: cuda
+seed: 0
+offload: false              # true => enable_model_cpu_offload; per-row override below
+
+# --- rows, in figure order ----------------------------------------------------
+# target_layer  the block this row probes (FLUX 0..56, PixArt-Sigma 0..27)
+# layers        per-row sweep spec used only with --sweep-layers ("all" or "0,5,10")
+# ablate_channels  explicit ids to isolate/ablate; [] => that layer's top-n_channels
+models:
+  - key: flux-schnell
+    label: FLUX.1-schnell
+    model_ckpt: black-forest-labs/FLUX.1-schnell
+    target_layer: 18        # last double-stream block
+    layers: all
+    ablate_channels: [154]
+    num_denoising_steps: 4
+    guidance_scale:         # distilled, no CFG
+
+  - key: flux1-dev
+    label: FLUX.1-dev
+    model_ckpt: black-forest-labs/FLUX.1-dev   # gated — accept the licence + set HF token
+    target_layer: 18
+    layers: all
+    ablate_channels: [154]
+    num_denoising_steps: 28
+    guidance_scale: 3.5
+
+  - key: pixart-sigma
+    label: PixArt-Sigma
+    model_ckpt: PixArt-alpha/PixArt-Sigma-XL-2-1024-MS
+    target_layer: 27        # last DiT block
+    layers: all
+    ablate_channels: [293]
+    num_denoising_steps: 20
+    guidance_scale: 4.5     # real CFG => batch is [uncond, cond]; we read the cond branch
