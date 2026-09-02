@@ -8,7 +8,11 @@ This one puts one **model** per row — same prompt, same seed, four columns:
 with ``C`` chosen **per model**, because massive-channel ids are per model and per layer
 (e.g. FLUX 154, PixArt-Sigma 293). Every row therefore carries its own column titles, not
 just the top one — the label has to name that row's channel or it is wrong for two rows out
-of three. The row label on the left names the model.
+of three. The row label on the left is the model name and nothing else.
+
+The figure carries **no suptitle, no colorbar and no layer label** — it is built to drop into
+a paper, where the prompt, the color mapping and the layer belong in the caption. The layer
+lives in the *filename* instead: one figure per layer, ``crossmodel_L<layer>.png``.
 
 The norm columns share ONE absolute scale **per row** (never across rows): different models
 have different widths D and different activation magnitudes, so a cross-row color scale would
@@ -17,14 +21,14 @@ see ``highnorm_qualitative.shared_norm_scale``.
 
 Capture and figure are separate stages joined by a cache, because the three models do not fit
 in memory together and one of them (FLUX.1-dev) is gated: each model is loaded alone, hooked
-on every requested layer in a SINGLE generation pass, written to
-``<output_dir>/cache/<key>/L<layer>.npz``, then freed. Re-runs reuse the cache, so a row that
-already ran is free and the figure can be reassembled (different layer, different channels)
-without touching a GPU.
+on every requested layer in a SINGLE generation pass (a full-depth sweep costs one generation,
+not one per layer), written to ``<output_dir>/cache/<key>/L<layer>.npz``, then freed. A row
+with a populated cache is reused as-is, so re-runs are free and the figures can be reassembled
+(different channels, different rows) without touching a GPU.
 
     python -m src.experiments.highnorm_crossmodel --config configs/highnorm_crossmodel.yaml
     python -m src.experiments.highnorm_crossmodel --config ... --only pixart-sigma --refresh
-    python -m src.experiments.highnorm_crossmodel --config ... --sweep-layers   # one fig/layer
+    python -m src.experiments.highnorm_crossmodel --config ... --layers 0,9,18
 """
 
 from __future__ import annotations
@@ -56,7 +60,7 @@ class RowSpec:
     model_ckpt: str
     label: str = ""  # row label on the figure (defaults to `key`)
     target_layer: int = 18  # the block this row probes
-    layers: str = ""  # per-model sweep: "", "all", or "0,5,10" (see --sweep-layers)
+    layers: str = ""  # layers to capture: "all", "0,5,10", or "" for target_layer only
     ablate_channels: list[int] = field(default_factory=list)  # explicit ids, e.g. [154]
     n_channels: int = 1  # used only when ablate_channels is empty (top-N per layer)
     num_denoising_steps: int = 4
@@ -234,12 +238,17 @@ def sweep_figure_layers(layers_by_key: dict[str, list[int]]) -> list[int]:
     return sorted(common or set())
 
 
-def figure_name(layer: int | None) -> str:
-    """``crossmodel_L<layer>.png`` for a sweep, ``crossmodel.png`` for per-model layers."""
-    return "crossmodel.png" if layer is None else f"crossmodel_L{int(layer)}.png"
+def figure_name(layer: int) -> str:
+    """``crossmodel_L<layer>.png`` — the layer is in the filename, one file per layer."""
+    return f"crossmodel_L{int(layer)}.png"
 
 
-def _save_figure(path: str, rows: list[dict[str, Any]], prompt: str) -> None:
+def _save_figure(path: str, rows: list[dict[str, Any]]) -> None:
+    """Draw the figure: no suptitle, no colorbar, no layer in the row label.
+
+    All three are deliberately absent — the layer is in the *filename* and the rest belongs
+    in the paper caption, so the panels get the space instead.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -247,15 +256,13 @@ def _save_figure(path: str, rows: list[dict[str, Any]], prompt: str) -> None:
 
     ncols = 4
     n = len(rows)
-    # Trailing thin column for the per-row colorbar, so the four image panels keep equal
-    # width and the rows stay aligned (stealing space from the norm axes would shrink only
-    # those). hspace leaves room for the per-row column titles.
+    # Compact: panels sized to leave only what the two-line per-row titles need.
     fig, axes = plt.subplots(
         n,
-        ncols + 1,
-        figsize=(3.0 * ncols + 0.6, 3.5 * n),
+        ncols,
+        figsize=(2.3 * ncols, 2.45 * n),
         squeeze=False,
-        gridspec_kw={"width_ratios": [1.0] * ncols + [0.08], "hspace": 0.32},
+        gridspec_kw={"wspace": 0.04, "hspace": 0.24},
     )
     for r, row in enumerate(rows):
         titles = row_titles(row["channels"])
@@ -269,23 +276,14 @@ def _save_figure(path: str, rows: list[dict[str, Any]], prompt: str) -> None:
             (row["n_full"], "viridis", v_lo, v_hi),
             (row["n_ex"], "viridis", v_lo, v_hi),
         ]
-        im_norm = None
         for c, (img, cmap, vlo, vhi) in enumerate(cells):
             ax = axes[r][c]
-            im = ax.imshow(img, cmap=cmap, vmin=vlo, vmax=vhi, interpolation="nearest")
-            if c == 2:
-                im_norm = im
+            ax.imshow(img, cmap=cmap, vmin=vlo, vmax=vhi, interpolation="nearest")
             ax.set_xticks([])
             ax.set_yticks([])
-            ax.set_title(titles[c], fontsize=10)  # every row, not just the first
-        axes[r][0].set_ylabel(f"{row['label']}\nlayer {row['layer']}", fontsize=11)
-        cbar_ax = axes[r][ncols]
-        if im_norm is not None:
-            fig.colorbar(im_norm, cax=cbar_ax, label="token L2 norm")
-        else:
-            cbar_ax.axis("off")
-    fig.suptitle(f'"{prompt}"', fontsize=12)
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+            ax.set_title(titles[c], fontsize=9, pad=4)  # every row, not just the first
+        axes[r][0].set_ylabel(row["label"], fontsize=10)
+    fig.savefig(path, dpi=200, bbox_inches="tight", pad_inches=0.04)
     plt.close(fig)
 
 
@@ -382,28 +380,41 @@ def capture_model(
 # --- runner -------------------------------------------------------------------
 
 
+def cached_layers(output_dir: str, key: str) -> list[int]:
+    """Layers already captured for one row, ascending, read off the cache folder."""
+    d = os.path.join(output_dir, "cache", key)
+    if not os.path.isdir(d):
+        return []
+    return sorted(int(f[1:-4]) for f in os.listdir(d) if f.startswith("L") and f.endswith(".npz"))
+
+
 def run(
     cfg: CrossModelConfig,
     only: str | None = None,
-    sweep_layers: bool = False,
+    layers_override: str | None = None,
     refresh: bool = False,
 ) -> list[str]:
-    """Capture any rows not already cached, then assemble the figure(s). Returns paths.
+    """Capture any rows not already cached, then write ONE FIGURE PER LAYER. Returns paths.
 
-    ``sweep_layers`` renders one figure per layer common to all rows (each row at that same
-    layer); otherwise every row is drawn at its own ``target_layer``. Rows missing from the
-    cache are reported and skipped rather than aborting the figure — a gated or OOM model
-    can be run later and the figure reassembled from cache for free.
+    Each row is captured over its own ``layers`` spec (``all`` by default), and a figure is
+    written for every layer present in *every* row — ``crossmodel_L<layer>.png``, so the
+    layer is in the filename rather than on the figure. Layers a row cannot supply (FLUX
+    has 57 blocks, PixArt-Sigma 28) are reported, not silently dropped.
+
+    A row whose cache folder is already populated is reused as-is and not regenerated; pass
+    ``refresh`` to re-capture it. Rows missing from the cache are reported and omitted from
+    the figure rather than aborting it — a gated or OOM model can be run later and the
+    figures reassembled from cache for free.
     """
     specs = select_rows(cfg, only)
     assert cfg.output_dir  # validated
 
     for spec in specs:
-        layers_spec = spec.layers if sweep_layers else ""
-        if not refresh and not layers_spec:
-            if os.path.isfile(cache_path(cfg.output_dir, spec.key, spec.target_layer)):
-                print(f"[xm] {spec.key}: cached L{spec.target_layer} — skipping generation")
-                continue
+        layers_spec = layers_override if layers_override is not None else spec.layers
+        have = cached_layers(cfg.output_dir, spec.key)
+        if have and not refresh:
+            print(f"[xm] {spec.key}: {len(have)} layer(s) already cached — skipping generation")
+            continue
         print(
             f"[xm] {spec.key}: generating ({spec.model_ckpt}, "
             f"layers={layers_spec or spec.target_layer})"
@@ -420,48 +431,37 @@ def run(
     # including rows captured by an earlier run.
     layers_by_key = {}
     for spec in cfg.models:
-        d = os.path.join(cfg.output_dir, "cache", spec.key)
-        if not os.path.isdir(d):
-            continue
-        found = sorted(
-            int(f[1:-4]) for f in os.listdir(d) if f.startswith("L") and f.endswith(".npz")
-        )
+        found = cached_layers(cfg.output_dir, spec.key)
         if found:
             layers_by_key[spec.key] = found
+    missing_rows = [m.key for m in cfg.models if m.key not in layers_by_key]
+    if missing_rows:
+        print(f"[xm] no cached rows for {missing_rows}; their row(s) will be omitted")
 
-    fig_layers: list[int | None]
-    if sweep_layers:
-        common = sweep_figure_layers(layers_by_key)
-        for key, found in layers_by_key.items():
-            dropped = [ly for ly in found if ly not in set(common)]
-            if dropped:  # never drop coverage silently
-                print(
-                    f"[xm] {key}: {len(dropped)} layer(s) not shared by all rows, no figure: "
-                    f"{dropped[0]}..{dropped[-1]}"
-                )
-        fig_layers = list(common)
-    else:
-        fig_layers = [None]
+    fig_layers = sweep_figure_layers(layers_by_key)
+    for key, found in layers_by_key.items():
+        dropped = [ly for ly in found if ly not in set(fig_layers)]
+        if dropped:  # never drop coverage silently
+            print(
+                f"[xm] {key}: {len(dropped)} captured layer(s) not shared by every row, "
+                f"no figure for {dropped[0]}..{dropped[-1]}"
+            )
+    if not fig_layers:
+        print(f"[xm] no layer is present in every row; cached layers: {layers_by_key}")
 
     out_paths: list[str] = []
-    for fl in fig_layers:
-        rows = []
-        missing = []
-        for spec in cfg.models:
-            ly = spec.target_layer if fl is None else fl
-            p = cache_path(cfg.output_dir, spec.key, ly)
-            if os.path.isfile(p):
-                rows.append(load_row(p))
-            else:
-                missing.append(f"{spec.key}@L{ly}")
-        if missing:
-            print(f"[xm] missing row(s), figure will omit them: {missing}")
+    for ly in fig_layers:
+        rows = [
+            load_row(cache_path(cfg.output_dir, spec.key, ly))
+            for spec in cfg.models
+            if os.path.isfile(cache_path(cfg.output_dir, spec.key, ly))
+        ]
         if not rows:
             continue
-        out_path = os.path.join(cfg.output_dir, figure_name(fl))
-        _save_figure(out_path, rows, cfg.prompt)
-        print(f"[xm] wrote {out_path} ({len(rows)} row(s))")
+        out_path = os.path.join(cfg.output_dir, figure_name(ly))
+        _save_figure(out_path, rows)
         out_paths.append(out_path)
+    print(f"[xm] wrote {len(out_paths)} figure(s) to {cfg.output_dir}")
     return out_paths
 
 
@@ -477,10 +477,11 @@ def main(argv: list[str] | None = None) -> None:
         "cache if present — use this to run a gated/large model on its own.",
     )
     p.add_argument(
-        "--sweep-layers",
-        action="store_true",
-        help="Render one figure per layer common to all rows, using each model's `layers` "
-        "spec. Default: every row at its own target_layer, one figure.",
+        "--layers",
+        default=None,
+        help="Override every row's `layers` spec: 'all' (the config default), a list "
+        "'0,5,10', or '' for each row's target_layer only. One figure is written per layer "
+        "present in every row, named crossmodel_L<layer>.png.",
     )
     p.add_argument(
         "--refresh",
@@ -500,7 +501,7 @@ def main(argv: list[str] | None = None) -> None:
     if override:
         for spec in select_rows(cfg, args.only):
             spec.ablate_channels = override
-    run(cfg, only=args.only, sweep_layers=args.sweep_layers, refresh=args.refresh)
+    run(cfg, only=args.only, layers_override=args.layers, refresh=args.refresh)
 
 
 if __name__ == "__main__":

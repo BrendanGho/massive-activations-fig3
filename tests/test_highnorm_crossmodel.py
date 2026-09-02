@@ -195,9 +195,10 @@ def test_sweep_figure_layers_empty_inputs():
     assert xm.sweep_figure_layers({"a": [1, 2], "b": [3]}) == []
 
 
-def test_figure_name():
-    assert xm.figure_name(None) == "crossmodel.png"
+def test_figure_name_always_carries_the_layer():
+    """The layer is in the filename, because it is no longer drawn on the figure."""
     assert xm.figure_name(12) == "crossmodel_L12.png"
+    assert xm.figure_name(0) == "crossmodel_L0.png"
 
 
 # --- figure -------------------------------------------------------------------
@@ -213,8 +214,8 @@ def test_save_figure_gives_every_row_its_own_titles(tmp_path):
         _fake_row("flux1-dev", "FLUX.1-dev", 18, (154,)),
         _fake_row("pixart-sigma", "PixArt-Sigma", 27, (293,)),
     ]
-    out = tmp_path / "crossmodel.png"
-    xm._save_figure(str(out), rows, "a red bicycle leaning against a brick wall")
+    out = tmp_path / "crossmodel_L18.png"
+    xm._save_figure(str(out), rows)
 
     assert out.is_file() and out.stat().st_size > 0
 
@@ -231,38 +232,74 @@ def test_row_scale_is_per_row_not_shared_across_models():
 # --- runner (capture stubbed; no GPU) -----------------------------------------
 
 
-def _stub_capture(monkeypatch, calls, layers=(18,)):
+def _stub_capture(monkeypatch, calls):
     """Replace the GPU capture with a fake that records which models it was asked for."""
 
     def fake(cfg, spec, layers_spec=None):
         calls.append(spec.key)
-        want = resolve_layers(layers_spec or spec.layers, list(range(28)), spec.target_layer)
+        want = resolve_layers(
+            layers_spec if layers_spec is not None else spec.layers,
+            list(range(28)),
+            spec.target_layer,
+        )
         return {ly: _fake_row(spec.key, spec.label, ly, spec.ablate_channels or [7]) for ly in want}
 
     monkeypatch.setattr(xm, "capture_model", fake)
     return calls
 
 
-def test_run_captures_then_assembles_one_figure(tmp_path, monkeypatch):
-    cfg = xm.load_crossmodel_config(_write_cfg(tmp_path))
+def _sweep_cfg(tmp_path, layers=("0,9,18", "0,9,18")):
+    rows = [dict(r, layers=ly) for r, ly in zip(_ROWS, layers)]
+    return xm.load_crossmodel_config(_write_cfg(tmp_path, models=rows))
+
+
+def test_run_writes_one_figure_per_layer_named_for_the_layer(tmp_path, monkeypatch):
+    cfg = _sweep_cfg(tmp_path)
     calls = _stub_capture(monkeypatch, [])
 
     paths = xm.run(cfg)
 
     assert calls == ["flux-schnell", "pixart-sigma"]
-    assert [os.path.basename(p) for p in paths] == ["crossmodel.png"]
-    assert os.path.isfile(xm.cache_path(cfg.output_dir, "flux-schnell", 18))
-    assert os.path.isfile(xm.cache_path(cfg.output_dir, "pixart-sigma", 27)), "own target layer"
+    assert sorted(os.path.basename(p) for p in paths) == [
+        "crossmodel_L0.png",
+        "crossmodel_L18.png",
+        "crossmodel_L9.png",
+    ]
+    for ly in (0, 9, 18):
+        assert os.path.isfile(xm.cache_path(cfg.output_dir, "pixart-sigma", ly))
+
+
+def test_run_only_draws_layers_present_in_every_row(tmp_path, monkeypatch):
+    """FLUX has 57 blocks and PixArt-Sigma 28 — only the shared ones can be drawn."""
+    cfg = _sweep_cfg(tmp_path, layers=("0,9,18,27", "0,9"))
+    _stub_capture(monkeypatch, [])
+
+    paths = xm.run(cfg)
+
+    names = sorted(os.path.basename(p) for p in paths)
+    assert names == ["crossmodel_L0.png", "crossmodel_L9.png"]
+
+
+def test_layers_override_applies_to_every_row(tmp_path, monkeypatch):
+    cfg = _sweep_cfg(tmp_path, layers=("all", "all"))
+    _stub_capture(monkeypatch, [])
+
+    paths = xm.run(cfg, layers_override="3,4")
+
+    assert sorted(os.path.basename(p) for p in paths) == [
+        "crossmodel_L3.png",
+        "crossmodel_L4.png",
+    ]
 
 
 def test_run_reuses_the_cache_and_refresh_overrides_it(tmp_path, monkeypatch):
-    cfg = xm.load_crossmodel_config(_write_cfg(tmp_path))
+    cfg = _sweep_cfg(tmp_path)
     calls = _stub_capture(monkeypatch, [])
     xm.run(cfg)
     calls.clear()
 
     xm.run(cfg)
-    assert calls == [], "a cached row must not regenerate"
+    assert calls == [], "a row with a populated cache must not regenerate"
 
     xm.run(cfg, refresh=True)
     assert calls == ["flux-schnell", "pixart-sigma"]
@@ -270,7 +307,7 @@ def test_run_reuses_the_cache_and_refresh_overrides_it(tmp_path, monkeypatch):
 
 def test_run_only_captures_one_model_but_draws_the_cached_rest(tmp_path, monkeypatch):
     """The gated/OOM workflow: fill in one row later, reassemble from cache."""
-    cfg = xm.load_crossmodel_config(_write_cfg(tmp_path))
+    cfg = _sweep_cfg(tmp_path)
     calls = _stub_capture(monkeypatch, [])
 
     xm.run(cfg, only="flux-schnell")
@@ -281,15 +318,20 @@ def test_run_only_captures_one_model_but_draws_the_cached_rest(tmp_path, monkeyp
     calls.clear()
     paths = xm.run(cfg, only="pixart-sigma")
     assert calls == ["pixart-sigma"]
-    assert len(paths) == 1, "figure still drawn, now with both rows"
+    assert len(paths) == 3, "figures still drawn, now with both rows"
 
 
-def test_run_sweep_writes_one_figure_per_common_layer(tmp_path, monkeypatch):
-    rows = [dict(r, layers="0,5,27") for r in _ROWS[:1]] + [dict(_ROWS[1], layers="0,5")]
-    cfg = xm.load_crossmodel_config(_write_cfg(tmp_path, models=rows))
+def test_run_writes_nothing_when_no_layer_is_shared(tmp_path, monkeypatch):
+    cfg = _sweep_cfg(tmp_path, layers=("0,1", "5,6"))
     _stub_capture(monkeypatch, [])
 
-    paths = xm.run(cfg, sweep_layers=True)
+    assert xm.run(cfg) == []
 
-    names = sorted(os.path.basename(p) for p in paths)
-    assert names == ["crossmodel_L0.png", "crossmodel_L5.png"], "L27 is not in every row"
+
+def test_cached_layers_reads_the_cache_folder(tmp_path):
+    out = str(tmp_path)
+    assert xm.cached_layers(out, "flux-schnell") == []
+    for ly in (18, 3, 9):
+        xm.save_row(xm.cache_path(out, "flux-schnell", ly), _fake_row(layer=ly))
+
+    assert xm.cached_layers(out, "flux-schnell") == [3, 9, 18]

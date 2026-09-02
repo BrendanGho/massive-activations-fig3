@@ -6,11 +6,14 @@
 #
 #   python -m src.experiments.highnorm_crossmodel --config configs/highnorm_crossmodel.yaml
 #
+# Writes one PNG per layer (crossmodel_L0.png, crossmodel_L1.png, ...). The figure itself
+# carries no title, no colorbar and no layer label — those belong in the paper caption.
+#
 # Don't know the channel id for a model/layer yet? Leave `ablate_channels: []` and it uses
 # that layer's top-`n_channels` channel and prints which one it picked, or read the ranking
 # from a highnorm_qualitative run (--report-top 15).
 
-output_dir:                 # where crossmodel.png and cache/ land (required)
+output_dir:                 # where crossmodel_L*.png and cache/ land (required)
 prompt: a red bicycle leaning against a brick wall
 
 # --- generation (shared by every row) -----------------------------------------
@@ -21,8 +24,11 @@ seed: 0
 offload: false              # true => enable_model_cpu_offload; per-row override below
 
 # --- rows, in figure order ----------------------------------------------------
-# target_layer  the block this row probes (FLUX 0..56, PixArt-Sigma 0..27)
-# layers        per-row sweep spec used only with --sweep-layers ("all" or "0,5,10")
+# layers        which blocks to capture: "all" (default), "0,5,10", or "" for target_layer
+#               only. One figure is written per layer present in EVERY row, named
+#               crossmodel_L<layer>.png (FLUX has 0..56, PixArt-Sigma 0..27, so a full
+#               sweep draws 0..27 and reports the FLUX-only layers it cannot pair).
+# target_layer  the block used when `layers` is empty
 # ablate_channels  explicit ids to isolate/ablate; [] => that layer's top-n_channels
 models:
   - key: flux-schnell

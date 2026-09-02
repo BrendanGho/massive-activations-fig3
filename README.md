@@ -223,21 +223,27 @@ left names the model and the layer it was probed at. The absolute norm scale (an
 colorbar) is **per row, never pooled across rows** — different models have different widths
 `D` and different activation magnitudes, so a shared cross-model scale would say nothing.
 
+The figure carries **no suptitle, no colorbar and no layer label** — it's built to drop into a
+paper, where the prompt, the color mapping and the layer belong in the caption, so the panels
+get that space instead. The layer lives in the **filename**: the run sweeps every layer
+(`layers: all`) and writes one figure per layer present in *every* row —
+`crossmodel_L0.png`, `crossmodel_L1.png`, … FLUX has 57 blocks and PixArt-Sigma 28, so a full
+sweep draws 0–27 and reports the FLUX-only layers it can't pair rather than dropping them
+silently. (Hooking every FLUX block holds ~3 GB of CPU RAM at peak — `n_layers × N_I × D`
+float32 — so pass `--layers 0,9,18` if memory-constrained.)
+
 Capture and figure are separate stages joined by a cache, because the three models don't fit
 in memory together and one of them (FLUX.1-dev) is gated: each model is loaded **alone**,
-hooked on every requested layer in a single generation pass, written to
-`<output_dir>/cache/<key>/L<layer>.npz`, then freed. Re-runs reuse the cache, so a row that
-already ran costs nothing and the figure can be reassembled — different layer, different
-channels — without a GPU. A row missing from the cache is reported and omitted rather than
-aborting the figure, so a gated or OOM model can be filled in later. Flags: `--only
-pixart-sigma` captures just that row (others still come from cache), `--refresh` regenerates
-over the cache, `--channels 154` overrides the ablated ids for the selected rows, and
-`--sweep-layers` uses each row's `layers:` spec to write one figure per layer **common to all
-rows** (FLUX 0–56 vs PixArt 0–27 → figures for 0–27; the rest are reported, not silently
-dropped; hooking every FLUX block holds ~3 GB of CPU RAM at peak — `n_layers × N_I × D`
-float32 — so pass a layer subset if memory-constrained). Leave a row's `ablate_channels: []`
-to isolate that layer's top-`n_channels` channel instead and have the titles report which one
-it picked.
+hooked on every requested layer in a single generation pass (a full-depth sweep costs one
+generation, not one per layer), written to `<output_dir>/cache/<key>/L<layer>.npz`, then
+freed. A row whose cache is populated is reused as-is, so re-runs cost nothing and the
+figures can be reassembled — different channels, different rows — without a GPU. A row
+missing from the cache is reported and omitted rather than aborting the figure, so a gated or
+OOM model can be filled in later. Flags: `--only pixart-sigma` captures just that row (others
+still come from cache), `--refresh` regenerates over the cache, `--channels 154` overrides the
+ablated ids for the selected rows, and `--layers` overrides every row's sweep spec. Leave a
+row's `ablate_channels: []` to isolate that layer's top-`n_channels` channel instead and have
+the titles report which one it picked.
 `python -m src.experiments.highnorm_crossmodel --config configs/highnorm_crossmodel.yaml`
 
 Model scope: FLUX.1 (schnell/dev) and FLUX.2-klein, plus **PixArt-Sigma** (a DiT that feeds
