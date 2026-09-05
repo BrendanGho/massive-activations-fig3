@@ -2,21 +2,6 @@
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/BrendanGho/massive-activations-fig3/blob/main/Figure3_Colab.ipynb)
 
-Reproduction of **Figure 3 / Section 3.2** of *"Few Channels Draw The Whole
-Picture: Revealing Massive Activations in Diffusion Transformers"*
-(arXiv:2605.13974) for FLUX.2-klein. (Not the Section 3.1 disruption experiment.)
-
-The claim under test: a tiny number of "massive-activation" channels in a diffusion
-transformer already localize the image subject. Selecting the **top-k** such channels
-per layer and clustering their per-token activations yields a foreground mask that
-matches a segmentation pseudo-ground-truth (BiRefNet), while **bottom-k** channels are
-diffuse and **random-k** sit in between.
-
-Two outputs:
-- **Qualitative** (a few example prompts): per-layer heatmap + binary mask for top-k
-  vs bottom-k channels (Fig 3A–C).
-- **Quantitative** (Fig 3D, all 1,600 GenAI-Bench prompts): layer-wise mIoU curve vs
-  BiRefNet pseudo-GT — one line each for top-k / bottom-k / random-k.
 
 ## Layout
 
