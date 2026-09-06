@@ -5,15 +5,6 @@ diffusion transformers: whether channel identities persist across generations, h
 of a token's norm comes from a few channels, and how these patterns vary across models
 and text/image streams.
 
-The repository began with a Figure 3 reproduction. That protocol remains an attributed
-[localization baseline](docs/localization_baseline.md); the studies below are the current
-research focus. Implemented analyses are research questions, not established novelty
-claims. Establishing a contribution requires measured results and comparison with prior work.
-
-[Open the Colab runner](https://colab.research.google.com/github/BrendanGho/massive-activations-fig3/blob/main/Figure3_Colab.ipynb).
-Its existing filename and numbered sections remain compatible with saved workflows.
-
-## Research questions
 
 | Study | Question | Evidence produced |
 |---|---|---|
