@@ -1,7 +1,7 @@
 # SPEC — Are massive-activation outlier tokens the same tokens as ViT "high-norm" tokens?
 
-Companion experiment to `SPEC.md` (Figure 3 reproduction). Separate file on purpose: the
-Figure 3 spec is still live and this is an independent question.
+Detailed norm-decomposition protocol for the research program in `SPEC.md`.
+The inherited localization baseline is documented in `docs/localization_baseline.md`.
 
 ## Question
 
@@ -35,10 +35,12 @@ The verdict rests on two **effect sizes**, deliberately not on set overlap:
 | Hypothesis | Signature | Reading |
 |---|---|---|
 | **H1** one mechanism | selectivity ≫ 1, **elevation ≈ 1** | Massive activations *are* how these tokens get their norm |
-| **H2** co-located, distinct | selectivity ≫ 1, **elevation ≫ 1** | Register tokens broadly elevated; massive channels one facet |
+| **H2** co-located, distinct | selectivity ≫ 1, **elevation ≫ 1** | Residual norms broadly elevated; a functional register role remains untested |
 | **H3** premise fails | **selectivity ≈ 1** | Channel is uniformly large, not token-sparse; no speckles to explain |
 
-H1 is the prior. H1-vs-H2 is the finding.
+H1, H2, and H3 are possible descriptive outcomes. A run must report its measured
+effect sizes; no outcome is assumed. Residual elevation alone does not establish a
+functional register role, and channel exclusion is post-hoc rather than a causal intervention.
 
 **Why not overlap-versus-null.** Two measurements that look natural are both unusable, and
 the tests pin this down so the rule does not get "simplified" back into them:

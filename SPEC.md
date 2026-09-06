@@ -1,8 +1,40 @@
-# SPEC — Reproduce Figure 3 (Massive Activations, FLUX.2-klein)
+# SPEC — Diffusion Activation Studies
 
-Reproduce **Figure 3 / Section 3.2** of arXiv:2605.13974 for FLUX.2-klein: four
-config-driven, cacheable, resumable stages producing the qualitative heatmaps/masks
-(Fig 3A–C) and the quantitative layer-wise mIoU curve (Fig 3D).
+## Scope
+
+Make channel identity, token norm decomposition, cross-model comparison, and text/image
+stream analysis the primary project interface. Keep the inherited Figure 3 localization
+baseline attributed and usable. This refactor adds no experimental evidence or priority claim.
+The detailed norm protocol is in `SPEC_highnorm.md`; the baseline guide is in
+`docs/localization_baseline.md`.
+
+## Research interpretation
+
+- Compare channel identities independently per prompt/seed/layer; report same-prompt and
+  different-prompt comparisons separately.
+- Report norm concentration and residual elevation after channel exclusion, alongside nulls.
+- Treat qualitative cross-model panels as exploratory and norm exclusion as post-hoc analysis.
+- Treat an unexpected localization curve as a possible result, not a failed reproduction.
+
+## Refactor acceptance criteria
+
+- `python -m src.experiments --help` lists all study commands without loading model libraries.
+- Each study command forwards its arguments to the existing driver, including driver help;
+  missing or unknown commands fail with usage information.
+- `localization` writes neutrally named CSV/plot artifacts. The historical stage-4 command
+  retains its filenames, and both commands allow an explicit artifact naming override.
+- Default evaluation rejects empty, non-finite, out-of-range, or invalid-count summaries;
+  it does not require top-k superiority or a particular peak layer or magnitude.
+- Historical curve comparisons execute only when `--reference-check` is requested.
+- README and Colab introduce the research questions, preserve baseline attribution, and
+  describe possible norm-decomposition outcomes without assuming a finding.
+- Existing CPU tests and the launcher/evaluation regression tests pass. GPU execution is
+  separate validation and is not implied by these tests.
+
+## Inherited baseline contract
+
+The following records the original numerical and cache protocol. Historical curve targets
+are optional comparisons; they are not acceptance criteria for the research studies.
 
 ## Acceptance criteria (testable)
 
@@ -32,11 +64,13 @@ Manual / Colab-only (require GPU + FLUX.2-klein + BiRefNet weights):
 
 - **AC9 — capture correctness.** Stage 1 hooks capture only image-stream tokens at the
   last denoising step; `N_I` derived at runtime; `run_metadata.json` records geometry.
-- **AC10 — Fig 3D shape.** top-k dominates every layer; bottom-k flat ≈ 0.2; random-k
-  between; top-k peak ≈ 0.5 near layer 10. `figure3d_results.csv` + `figure3d_curve.png`
-  produced; `sanity_check` prints warnings (does not assert) on deviation.
+- **AC10 — evaluation artifacts.** Write the results CSV and curve PNG. The historical
+  command uses `figure3d_*` filenames; the study launcher uses `localization_*`.
+  Historical comparison targets (optional): top-k dominates every layer, bottom-k
+  flat ≈ 0.2, random-k between, top-k peak ≈ 0.5 near layer 10. `--reference-check`
+  reports differences without treating them as implementation errors.
 - **AC11 — qualitative dump.** heatmap+mask PNGs saved for `num_example_prompts` prompts;
-  top-k subject-coherent, bottom-k diffuse.
+  inspect subject coherence across all strategies without requiring a particular outcome.
 
 ## Logged ambiguities (paper-unspecified → written to run_metadata.json, not silently picked)
 
@@ -45,6 +79,6 @@ Manual / Colab-only (require GPU + FLUX.2-klein + BiRefNet weights):
   derived per (seed, prompt_id, layer, strategy).
 - GenAI-Bench split/version = logged as source path + content SHA-256 of the prompt set.
 
-## Fixed (do not sweep)
+## Historical baseline settings
 
 `num_denoising_steps=4`, `resolution=1024`, `top_k=12`.

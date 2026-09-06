@@ -1,4 +1,8 @@
-"""Stage 4 — Figure 3D: layer-wise mIoU vs. BiRefNet pseudo-GT.
+"""Foreground localization baseline: layer-wise mIoU vs. BiRefNet pseudo-GT.
+
+Inherited from the Figure 3 protocol documented in docs/localization_baseline.md.
+The study launcher selects localization_* artifacts; this historical entry point
+retains figure3d_* filenames. Reference-curve comparisons require --reference-check.
 
 For every cached prompt: BiRefNet(decoded RGB) -> pseudo-GT foreground mask. For
 every (layer, strategy) the stored latent-res mask is upsampled to the eval
@@ -78,8 +82,21 @@ def _iou_upsampled(mask_lat: np.ndarray, gt: np.ndarray, out_hw: tuple[int, int]
     return io.iou(pred, gt)
 
 
-def write_results_csv(results: dict, output_dir: str) -> str:
-    path = os.path.join(output_dir, "figure3d_results.csv")
+def validate_results(results: dict) -> None:
+    """Check summary validity without prescribing an experimental outcome."""
+    if not results:
+        raise ValueError("No localization results to report.")
+    for key, (mean, std, n) in results.items():
+        if not np.isfinite(mean) or not 0 <= mean <= 1:
+            raise ValueError(f"Invalid mean IoU for {key}: {mean}")
+        if not np.isfinite(std) or not 0 <= std <= 0.5:
+            raise ValueError(f"Invalid IoU standard deviation for {key}: {std}")
+        if isinstance(n, (bool, np.bool_)) or not isinstance(n, (int, np.integer)) or n <= 0:
+            raise ValueError(f"Invalid sample count for {key}: {n}")
+
+
+def write_results_csv(results: dict, output_dir: str, artifact_prefix: str = "figure3d") -> str:
+    path = os.path.join(output_dir, f"{artifact_prefix}_results.csv")
     rows = sorted(results.items(), key=lambda kv: (kv[0][1], kv[0][0]))
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
@@ -89,7 +106,7 @@ def write_results_csv(results: dict, output_dir: str) -> str:
     return path
 
 
-def plot_curve(results: dict, output_dir: str) -> str:
+def plot_curve(results: dict, output_dir: str, artifact_prefix: str = "figure3d") -> str:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -116,10 +133,10 @@ def plot_curve(results: dict, output_dir: str) -> str:
         )
     ax.set_xlabel("transformer layer")
     ax.set_ylabel("mIoU vs. BiRefNet pseudo-GT")
-    ax.set_title("Figure 3D — layer-wise mIoU by channel-selection strategy")
+    ax.set_title("Foreground localization by channel-selection strategy")
     ax.legend()
     ax.grid(True, alpha=0.3)
-    path = os.path.join(output_dir, "figure3d_curve.png")
+    path = os.path.join(output_dir, f"{artifact_prefix}_curve.png")
     fig.tight_layout()
     fig.savefig(path, dpi=120)
     plt.close(fig)
@@ -127,11 +144,7 @@ def plot_curve(results: dict, output_dir: str) -> str:
 
 
 def sanity_check(results: dict) -> list[str]:
-    """Print (not assert) warnings if the curve shape deviates from the targets.
-
-    Likely bug locations if this trips: normalization order (Stage 3 step 1) or the
-    abs-then-mean ranking (Stage 2).
-    """
+    """Compare with inherited approximate targets, not implementation correctness."""
     warnings: list[str] = []
     layers = sorted({layer for (layer, _s) in results})
 
@@ -142,15 +155,14 @@ def sanity_check(results: dict) -> list[str]:
     dominated = [
         layer
         for layer in layers
-        if not (
+        if all((layer, s) in results for s in STRATEGIES)
+        and not (
             mean_at(layer, "top") >= mean_at(layer, "bottom")
             and mean_at(layer, "top") >= mean_at(layer, "random")
         )
     ]
     if dominated:
-        warnings.append(
-            f"top-k does NOT dominate at layers {dominated} — check abs-then-mean ranking."
-        )
+        warnings.append(f"top-k does not dominate at layers {dominated}.")
 
     # 2. bottom-k should be flat and low (~0.2).
     bmean = float("nan")
@@ -166,15 +178,15 @@ def sanity_check(results: dict) -> list[str]:
     # 3. random-k should sit between bottom and top on average.
     tops = [mean_at(layer, "top") for layer in layers]
     rands = [mean_at(layer, "random") for layer in layers]
-    tmean = float(np.nanmean(tops)) if tops else float("nan")
-    rmean = float(np.nanmean(rands)) if rands else float("nan")
+    tmean = float(np.nanmean(tops)) if np.any(np.isfinite(tops)) else float("nan")
+    rmean = float(np.nanmean(rands)) if np.any(np.isfinite(rands)) else float("nan")
     if not np.isnan(rmean) and not np.isnan(bmean) and not (bmean - 0.05 <= rmean <= tmean + 0.05):
         warnings.append(
             f"random-k mean {rmean:.3f} not between bottom {bmean:.3f} and top {tmean:.3f}."
         )
 
     # 4. top-k peak magnitude / location.
-    if tops:
+    if np.any(np.isfinite(tops)):
         peak_layer = layers[int(np.nanargmax(tops))]
         peak_val = float(np.nanmax(tops))
         if abs(peak_val - _TARGET_TOP_PEAK) > 0.15:
@@ -185,18 +197,29 @@ def sanity_check(results: dict) -> list[str]:
             )
 
     if warnings:
-        print("[stage4][SANITY] deviations from Figure 3D targets:")
+        print("[stage4][REFERENCE] differences from historical Figure 3D targets:")
         for w in warnings:
             print(f"  - {w}")
     else:
-        print("[stage4][SANITY] curve shape matches Figure 3D targets.")
+        print("[stage4][REFERENCE] no differences flagged against historical targets.")
     return warnings
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Stage 4: evaluate Figure 3D mIoU curves.")
+    p = argparse.ArgumentParser(description="Evaluate foreground localization mIoU curves.")
     p.add_argument("--config", required=True)
     p.add_argument("--set", dest="overrides", action="append", default=[])
+    p.add_argument(
+        "--artifact-prefix",
+        choices=("localization", "figure3d"),
+        default="figure3d",
+        help="Artifact names (historical entry point defaults to figure3d).",
+    )
+    p.add_argument(
+        "--reference-check",
+        action="store_true",
+        help="Compare with historical Figure 3D targets; differences are not errors.",
+    )
     p.add_argument(
         "--limit", type=int, default=None, help="Only evaluate the first N cached prompts."
     )
@@ -207,9 +230,11 @@ def main(argv: list[str] | None = None) -> None:
     args = _build_arg_parser().parse_args(argv)
     cfg = load_config(args.config, parse_set_overrides(args.overrides))
     results = evaluate(cfg, limit=args.limit)
-    csv_path = write_results_csv(results, cfg.output_dir)
-    png_path = plot_curve(results, cfg.output_dir)
-    sanity_check(results)
+    validate_results(results)
+    csv_path = write_results_csv(results, cfg.output_dir, args.artifact_prefix)
+    png_path = plot_curve(results, cfg.output_dir, args.artifact_prefix)
+    if args.reference_check:
+        sanity_check(results)
     print(f"[stage4] wrote {csv_path} and {png_path}")
 
 
