@@ -1,133 +1,75 @@
-# Fig 3 — Massive Activations in Diffusion Transformers 
+# Diffusion Activation Studies
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/BrendanGho/massive-activations-fig3/blob/q7-generation-function/Figure3_Colab.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/BrendanGho/massive-activations-fig3/blob/main/Figure3_Colab.ipynb)
 
-Reproduction of **Figure 3 / Section 3.2** of *"Few Channels Draw The Whole
-Picture: Revealing Massive Activations in Diffusion Transformers"*
-(arXiv:2605.13974) for FLUX.2-klein. (Not the Section 3.1 disruption experiment.)
+Experiments on how activation magnitude is distributed across channels and tokens in
+diffusion transformers: whether channel identities persist across generations, how much
+of a token's norm comes from a few channels, and how these patterns vary across models
+and text/image streams.
 
-The claim under test: a tiny number of "massive-activation" channels in a diffusion
-transformer already localize the image subject. Selecting the **top-k** such channels
-per layer and clustering their per-token activations yields a foreground mask that
-matches a segmentation pseudo-ground-truth (BiRefNet), while **bottom-k** channels are
-diffuse and **random-k** sit in between.
 
-Two outputs:
-- **Qualitative** (a few example prompts): per-layer heatmap + binary mask for top-k
-  vs bottom-k channels (Fig 3A–C).
-- **Quantitative** (Fig 3D, all 1,600 GenAI-Bench prompts): layer-wise mIoU curve vs
-  BiRefNet pseudo-GT — one line each for top-k / bottom-k / random-k.
+| Study | Question | Evidence produced |
+|---|---|---|
+| Channel stability | Do top-channel identities depend on prompt, seed, or denoising step? | Pairwise Jaccard, same-prompt vs different-prompt comparisons, rank agreement |
+| Norm decomposition | Do outlier tokens remain high-norm after excluding selected channels? | Selectivity, residual elevation, norm fractions, null comparisons |
+| Cross-model panels | Does norm concentration recur across architectures and layers? | Cached per-model, per-layer panels on a shared prompt and seed |
+| Text/image streams | Which text positions have high norms, and are dominant channels shared with images? | Token-position profiles and within-model channel overlap |
+| Localization baseline | How do selected channels align with foreground pseudo-labels? | Per-layer top/bottom/random-k mIoU |
 
-## Layout
-
-```
-configs/default.yaml            # single source of config (see precedence below)
-src/common/config.py            # config loading + strict validation
-src/common/model_utils.py       # FLUX.2-klein + BiRefNet loading, capture hooks (lazy torch)
-src/common/clustering.py        # Stage 3 numeric core (normalize -> KMeans(2) -> mask)
-src/common/io.py                # reduced-cache shards, prompt loading, IoU, upsampling
-src/stage1_generate_and_cache.py
-src/stage2_channel_ranking.py
-src/stage3_mask_construction.py
-src/stage4_evaluate_figure3d.py
-scripts/run_pipeline.sh         # resumable end-to-end wrapper
-tests/test_fig3_*.py            # CPU tests for the numeric core
-outputs/  cache/                # runtime only (gitignored)
-```
-
-## Install
+## Install and run
 
 ```bash
-uv sync                    # core + test deps (numpy, scikit-learn) — enough to run the tests
-uv sync --extra fig3       # + torch/diffusers/transformers/matplotlib for the real run (GPU/Colab)
-# or: pip install -e ".[fig3]"
+uv sync                    # development and CPU tests
+uv sync --extra fig3       # historical extra name for GPU experiment dependencies
+uv run python -m src.experiments --help
 ```
 
-The numeric core (`config`, `clustering`, `io`, ranking) is pure `numpy`/`scikit-learn`
-and importable without a GPU. `torch`/`diffusers`/`transformers`/`matplotlib` are imported
-**lazily** inside the model-touching stages, so the tests run anywhere.
-
-## Configure
-
-Fill the five **required** keys in `configs/default.yaml` (or override them — the loader
-**fails loudly** if any is empty, because this runs unattended):
-
-| key | example |
-|---|---|
-| `model_ckpt` | `black-forest-labs/FLUX.2-klein-4B` (ungated) or `-9B` (gated) — HF id or local dir |
-| `prompt_source` | 1,600 GenAI-Bench prompts; defaults to the bundled `data/genai_prompts.jsonl` — or point it at another `.txt` / `.json` / `.jsonl` / `.parquet` file, or an HF dataset id |
-| `birefnet_weights` | `ZhengPeng7/BiRefNet` |
-| `output_dir` | where CSV / plots / qualitative / `run_metadata.json` land |
-| `activation_cache_dir` | where reduced cache shards land |
-
-**Override precedence (highest wins): CLI flag > `FIG3_*` env var > YAML.**
+Set `output_dir` in the chosen study YAML and review its model, prompts, seeds, layers,
+and device settings. Localization additionally requires the paths and model IDs in
+`configs/default.yaml`; see the baseline guide. Run commands from the repository root.
 
 ```bash
-# env override
-FIG3_TOP_K=12 FIG3_SEED=1 python -m src.stage1_generate_and_cache --config configs/default.yaml
-# CLI override (repeatable)
-python -m src.stage1_generate_and_cache --config configs/default.yaml --set seed=1 --set device=cuda
+uv run python -m src.experiments stability --config configs/channel_stability.yaml
+uv run python -m src.experiments norms --config configs/highnorm_tokens.yaml
+uv run python -m src.experiments norm-panels --config configs/highnorm_tokens.yaml --subtract-ks 5,10,20
+uv run python -m src.experiments cross-model --config configs/highnorm_crossmodel.yaml
+uv run python -m src.experiments text --config configs/highnorm_tokens.yaml --layers all
 ```
 
-## Run
+Each command accepts its existing driver's arguments; use `<study> --help` for details.
+The original module commands still work. Localization evaluates an existing reduced cache:
 
 ```bash
-# fused (default, recommended for the full 1,600-prompt run)
-python -m src.stage1_generate_and_cache --config configs/default.yaml --fused
-python -m src.stage4_evaluate_figure3d  --config configs/default.yaml
-
-# or the resumable wrapper (skips already-cached prompts)
-scripts/run_pipeline.sh configs/default.yaml
+uv run python -m src.stage1_generate_and_cache --config configs/default.yaml --fused
+uv run python -m src.experiments localization --config configs/default.yaml
 ```
 
-`FLUX.2-klein-4B` is ~16 GB in half precision (Qwen3-4B text encoder + 4B transformer),
-so it needs a ≥24 GB GPU to load fully; on a 16 GB T4 set `offload: true` (or `--set
-offload=true`) to enable `enable_model_cpu_offload` (fits, slower).
+This produces `localization_results.csv` and `localization_curve.png`. Numerical validation
+checks finite, bounded summary statistics and sample counts. Comparison with historical
+Figure 3 expectations is available explicitly through `--reference-check`.
 
-**Fused mode** (default) runs Stages 2+3 in-process right after each capture and persists
-only small reduced artifacts (scores, channel indices, binary masks, decoded RGB,
-qualitative PNGs). The full `[N_I, D]` per-layer tensor is discarded — at FLUX hidden
-width across ~all layers × 1,600 prompts it would be hundreds of GB.
+## Layout and provenance
 
-**Debugging the stages standalone** (on a handful of cached prompts):
+- `src/experiments/`: study drivers and the shared command launcher.
+- `src/common/`: capture hooks, ranking support, spatial utilities, and norm statistics.
+- `src/stage1_*` through `src/stage4_*`: inherited cache and localization pipeline.
+- `configs/`: explicit settings for each experiment family.
+- `SPEC.md`: current project scope and acceptance criteria.
+- `SPEC_highnorm.md`: detailed norm-decomposition protocol.
+- `docs/localization_baseline.md`: inherited protocol, attribution, and compatibility details.
+- `src/harness/`: supporting agent and knowledge-store tooling.
 
-```bash
-python -m src.stage1_generate_and_cache --config cfg.yaml --no-fused --limit 4  # persist full acts
-python -m src.stage2_channel_ranking    --config cfg.yaml --prompt-id 0
-python -m src.stage3_mask_construction  --config cfg.yaml --prompt-id 0 --qualitative
-python -m src.stage4_evaluate_figure3d  --config cfg.yaml
-```
+The localization implementation follows the Figure 3 / Section 3.2 protocol attributed in
+this repository to *Few Channels Draw The Whole Picture: Revealing Massive Activations in
+Diffusion Transformers* (arXiv:2605.13974). The high-norm study builds on the register-token
+question attributed to Darcet et al. in `SPEC_highnorm.md` (arXiv:2309.16588).
+Shared capture conventions, channel ranking, and baseline methods retain that provenance.
 
-## Invariants (do not "simplify" these)
+Norm exclusion operates on captured activations. It measures component contributions;
+it does not intervene in generation or demonstrate a functional register role. The
+cross-model panels are exploratory comparisons, and the configured prompt grids are small.
 
-1. **Only image-stream tokens, only the last denoising timestep.** The text/image split
-   is derived at runtime from the model's packed sequence (`N_I` = image-latent token
-   count), never a hard-coded offset. Last timestep is captured by hooks overwriting a
-   per-layer buffer each forward.
-2. **Channel score = `mean(abs(activations))` over tokens — abs *then* mean**, not
-   `abs(mean(...))`. The ordering changes the ranking. (`test_fig3_ranking.py` pins this.)
-3. **Ranking stats are per-sample / per-layer / per-stream** — activations/scores are
-   never averaged across samples before ranking.
-4. **Stage 3 order:** min-max normalize each channel across tokens **first**, then
-   KMeans(2) on the **k-dim per-token vectors** (not a collapsed scalar); foreground is
-   the cluster with the higher mean of `s[n] = normalized[n,:].sum()` (the Fig 3B heatmap).
-
-## Outputs
-
-- `outputs/run_metadata.json` — resolved config, package versions, prompt-source hash,
-  and the **logged ambiguity choices** (random-k trial count, KMeans init/seed defaults,
-  capture conventions).
-- `outputs/figure3d_results.csv` — `layer, strategy, mean_miou, std_miou, n`.
-- `outputs/figure3d_curve.png` — the three mIoU curves.
-- `outputs/qualitative/prompt_XXXXX/` — heatmap+mask PNGs for the first
-  `num_example_prompts` prompts.
-
-**Sanity targets** (printed as warnings, not asserted): top-k dominates every layer,
-bottom-k flat ≈ 0.2, random-k between, FLUX.2-klein top-k peak ≈ 0.5 near layer 10.
-If the shape is off, the likely culprits are the normalization order or the abs-then-mean
-ranking.
-
-## Part 2 — per-generation channel stability (the main experiment)
+## Channel identity across generations
 
 `src/experiments/channel_stability.py` + `configs/channel_stability.yaml` (driven by the
 Part 2 cells of `Figure3_Colab.ipynb`). Question: *for each individual generation
@@ -147,8 +89,8 @@ exists to make:
 and `stability_overlap.png` shows the block-structured pairwise matrix (diagonal blocks =
 same prompt) beside a same-prompt vs diff-prompt pair plot.
 
-**Scores.** Primary = `mean(abs(activations))` over tokens (the fig3 massive-activation score;
-invariant #2 above). Secondary (`secondary_metric: p999`) = 99.9th percentile of
+**Scores.** Primary = `mean(abs(activations))` over tokens (abs then mean).
+Secondary (`secondary_metric: p999`) = 99.9th percentile of
 `abs(activation)` over tokens — a token-localized complement that catches channels
 massive at only a few tokens, which the mean dilutes. The summary reports per-k
 agreement between the two rankings. Part 2 is **channel-space only**; there is no
@@ -176,7 +118,7 @@ high-norm *token* analysis here.
 - `stability_summary.json` — all numbers above plus `figure_errors` (any figure that
   failed to render, with traceback).
 
-## Part 3 — are the sparse outlier tokens the same as ViT "high-norm" tokens?
+## Token norm decomposition
 
 `src/experiments/highnorm_tokens.py` + `configs/highnorm_tokens.yaml`, numeric core in
 `src/common/highnorm.py`, spec in [`SPEC_highnorm.md`](SPEC_highnorm.md). Question:
@@ -188,9 +130,9 @@ channel-space only, this is a **token-space** question.
 **Start here — the qualitative look.** `src/experiments/highnorm_qualitative.py` is the
 simplest version: no statistics, one row per prompt — `generated` | `isolated top-1 channel`
 (the speckles) | `high-norm tokens` (the full L2 norm) | `high-norm tokens, top-1 channel
-ablated` (that channel deleted from the norm). The full-norm panel is a carbon copy of the
-speckles (that's the confound below, made visible); whether the last panel still lights up at
-those spots is the whole question. `--subtract-ks 5,10,20` adds one further `top-k channels
+ablated` (that channel deleted from the norm). The full-norm panel can resemble the
+speckles because it includes the selected channel; whether the last panel still lights up
+at those spots is the question. `--subtract-ks 5,10,20` adds one further `top-k channels
 ablated` column per k, to watch the high-norm token fade (or persist) as more massive channels
 are peeled off. The figure is titled `Layer <n>` and carries no per-row prompt label — the
 prompts are in the config, and stripping them keeps the panels the same width. All the
@@ -210,7 +152,7 @@ layer), and each layer is written to its own file. Outputs are foldered by chann
 layer sweep for one channel set lands in one folder, and each different ablated channel gets
 its own folder — built for sweeping all layers × a few channel sets. (Capturing every layer
 holds ~`n_layers × N × D` of CPU RAM at peak; pass a layer subset if memory-constrained.)
-`python -m src.experiments.highnorm_qualitative --config configs/highnorm_tokens.yaml --subtract-ks 5,10,20 --report-top 15`
+`python -m src.experiments norm-panels --config configs/highnorm_tokens.yaml --subtract-ks 5,10,20 --report-top 15`
 
 **Cross-model version — one row per model, its own ablated channel.**
 `src/experiments/highnorm_crossmodel.py` + `configs/highnorm_crossmodel.yaml` swaps the row
@@ -219,8 +161,7 @@ axis from prompts to **models**: same prompt, same seed, one row per model, four
 `C` set **per model**, because massive-channel ids are per model *and* per layer (FLUX 154,
 PixArt-Sigma 293). Every row therefore carries its **own** column titles naming its own
 channel; a single header row would mislabel every row but the first. The row label on the
-left names the model and the layer it was probed at. The absolute norm scale (and its
-colorbar) is **per row, never pooled across rows** — different models have different widths
+left names the model and the layer it was probed at. The absolute norm scale is **per row, never pooled across rows** — different models have different widths
 `D` and different activation magnitudes, so a shared cross-model scale would say nothing.
 
 The figure carries **no suptitle, no colorbar and no layer label** — it's built to drop into a
@@ -244,7 +185,7 @@ still come from cache), `--refresh` regenerates over the cache, `--channels 154`
 ablated ids for the selected rows, and `--layers` overrides every row's sweep spec. Leave a
 row's `ablate_channels: []` to isolate that layer's top-`n_channels` channel instead and have
 the titles report which one it picked.
-`python -m src.experiments.highnorm_crossmodel --config configs/highnorm_crossmodel.yaml`
+`python -m src.experiments cross-model --config configs/highnorm_crossmodel.yaml`
 
 Model scope: FLUX.1 (schnell/dev) and FLUX.2-klein, plus **PixArt-Sigma** (a DiT that feeds
 the transformer a 4D conv latent and uses real classifier-free guidance — the capture hooks
@@ -264,9 +205,10 @@ Every statistic is therefore computed against `N_ex` — the norm with the massi
 - `elevation` = median `N_ex`[outlier] / median `N_ex`[typical] — do those tokens stay
   high-norm once the massive channels are removed? *This is the question, numerically.*
 
-→ **H1** (selectivity ≫ 1, elevation ≈ 1): same phenomenon; massive activations *are* how
-these tokens get their norm. **H2** (both ≫ 1): genuine register tokens, broadly elevated.
-**H3** (selectivity ≈ 1): channel is uniformly large, no speckles to explain.
+**H1** (selectivity ≫ 1, elevation ≈ 1) describes concentrated norm in the selected
+channels. **H2** (both ≫ 1) describes residual elevation across other channels.
+**H3** (selectivity ≈ 1) describes a uniformly large channel. These are descriptive
+signatures; they do not establish a register function or a causal mechanism.
 
 Two seemingly natural measurements are unusable and the tests pin this down: `ρ` (share of
 squared norm owned by the massive channels) **cannot separate H1 from H3** — both give ≈ 1 —
@@ -290,10 +232,10 @@ plain Gaussian *and* on a heavy-tailed lognormal and so cannot tell a separated 
 mode from a mere long tail.
 
 ```bash
-python -m src.experiments.highnorm_tokens --config configs/highnorm_tokens.yaml
+python -m src.experiments norms --config configs/highnorm_tokens.yaml
 ```
 
-## Part 4 — text stream (high-norm tokens & massive channels)
+## Text and image streams
 
 `src/experiments/text_stream_qualitative.py` (Colab Part 4). Everything above analyzes the
 **image** stream; this points the *same channel lens* (rank channels by mean|abs|, per-token
@@ -311,16 +253,15 @@ ablation.
   `_extract_text_stream`).
 - **PixArt (cross-attn DiT)** — the DiT has **no** text stream (text is a frozen T5 encoding
   used via cross-attention). The real text stream is inside the **T5 encoder**, captured per T5
-  layer (`register_text_encoder_hooks`). The reference repo's PixArt "text" hook is a **bug** —
-  it hooks the image-only DiT blocks and slices the last `text_len` positions, capturing the
-  bottom-right *image* corner, not text — so we use T5 instead.
+  layer (`register_text_encoder_hooks`). Slicing image-only DiT outputs would capture image positions, so this analysis uses T5.
+  T5 encoder depth and FLUX DiT depth represent different computational stages.
 
 Outputs are foldered by source: `<output_dir>/text_{dit|t5}/text_L<layer>_ch<base_k>.png`.
 The numeric core is `src/common/highnorm.py`, reused unchanged; only the capture (text slice /
 T5 hook) and the 1-D visualization are new.
 
 ```bash
-python -m src.experiments.text_stream_qualitative --config configs/highnorm_tokens.yaml --layers all
+python -m src.experiments text --config configs/highnorm_tokens.yaml --layers all
 ```
 
 ## Colab storage
@@ -331,8 +272,8 @@ Point both dirs at a Drive mount so writes survive a session ending mid-run (no 
 from google.colab import drive; drive.mount('/content/drive')
 ```
 ```yaml
-output_dir:           /content/drive/MyDrive/figure3_repro/outputs
-activation_cache_dir: /content/drive/MyDrive/figure3_repro/cache
+output_dir:           /content/drive/MyDrive/activation_studies/outputs
+activation_cache_dir: /content/drive/MyDrive/activation_studies/cache
 ```
 
 Reduced artifacts are batched `cache_batch_size` (~25–50) prompts per shard file to keep
