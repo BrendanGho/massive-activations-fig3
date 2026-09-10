@@ -1,6 +1,6 @@
 # Fig 3 — Massive Activations in Diffusion Transformers 
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/BrendanGho/massive-activations-fig3/blob/main/Figure3_Colab.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/BrendanGho/massive-activations-fig3/blob/q7-generation-function/Figure3_Colab.ipynb)
 
 Reproduction of **Figure 3 / Section 3.2** of *"Few Channels Draw The Whole
 Picture: Revealing Massive Activations in Diffusion Transformers"*
