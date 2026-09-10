@@ -187,6 +187,244 @@ def paired_bootstrap(
     }
 
 
+def _finite_metric_values(rows: Iterable[dict[str, Any]], metric: str) -> list[float]:
+    """Return finite numeric metric values, tolerating blank CSV cells."""
+    values = []
+    for row in rows:
+        value = row.get(metric)
+        if value in (None, ""):
+            continue
+        value = float(value)
+        if np.isfinite(value):
+            values.append(value)
+    return values
+
+
+def _load_paired_metrics(path: Path) -> list[dict[str, Any]]:
+    with path.open(newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def _scenario_metric_values(rows: Iterable[dict[str, Any]], metric: str) -> list[float]:
+    """Average repeated phase/zone cells within scenario before cross-scenario inference."""
+    grouped: dict[tuple[str, str], list[float]] = {}
+    for row in rows:
+        values = _finite_metric_values([row], metric)
+        if values:
+            key = (str(row.get("prompt_id", row.get("prompt", ""))), str(row.get("seed", "")))
+            grouped.setdefault(key, []).append(values[0])
+    return [float(np.mean(values)) for values in grouped.values()]
+
+
+def generate_figures(cfg: Q7Config) -> list[Path]:
+    """Render causal, frequency, fidelity, v* and representative image figures."""
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+    from PIL import Image, ImageDraw
+
+    root = Path(cfg.output_dir)
+    metrics_path = root / "paired_metrics.csv"
+    if not metrics_path.exists():
+        raise FileNotFoundError(f"paired metrics not found at {metrics_path}; run --evaluate first")
+    rows = _load_paired_metrics(metrics_path)
+    if not rows:
+        raise RuntimeError(f"no paired rows found in {metrics_path}")
+
+    figures = root / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    conditions = [c for c in cfg.conditions if c != "baseline"]
+    phases, zones = list(cfg.phases), list(cfg.zones)
+    pretty = {
+        "remove_vstar": "Remove v*",
+        "suppress_channel_154": f"Suppress channel {cfg.channel}",
+        "suppress_sink": "Suppress sink",
+        "remove_top_registers": "Remove registers",
+        "norm_only": "Norm only",
+    }
+    outputs = []
+
+    # Condition x (depth, time) causal maps with one shared perceptual-distance scale.
+    matrices = {}
+    for condition in conditions:
+        matrix = np.full((len(zones), len(phases)), np.nan)
+        for zi, zone in enumerate(zones):
+            for pi, phase in enumerate(phases):
+                cell = [
+                    row
+                    for row in rows
+                    if row.get("condition") == condition
+                    and row.get("phase") == phase
+                    and row.get("zone") == zone
+                ]
+                values = _finite_metric_values(cell, "lpips")
+                if values:
+                    matrix[zi, pi] = float(np.mean(values))
+        matrices[condition] = matrix
+    finite_parts = [matrix[np.isfinite(matrix)] for matrix in matrices.values()]
+    finite_lpips = np.concatenate(finite_parts) if finite_parts else np.array([])
+    vmax = float(finite_lpips.max()) if finite_lpips.size else 1.0
+    fig, axes = plt.subplots(
+        1, len(conditions), figsize=(3.15 * len(conditions), 4.2), constrained_layout=True
+    )
+    axes = np.atleast_1d(axes)
+    image = None
+    for ax, condition in zip(axes, conditions):
+        matrix = matrices[condition]
+        image = ax.imshow(matrix, vmin=0, vmax=max(vmax, 1e-12), cmap="magma", aspect="auto")
+        ax.set_title(pretty.get(condition, condition), fontsize=10)
+        ax.set_xticks(range(len(phases)), phases, rotation=35, ha="right")
+        ax.set_yticks(range(len(zones)), zones if ax is axes[0] else [])
+        for zi in range(len(zones)):
+            for pi in range(len(phases)):
+                value = matrix[zi, pi]
+                color = "white" if np.isfinite(value) and value > vmax * 0.45 else "black"
+                ax.text(
+                    pi,
+                    zi,
+                    "—" if not np.isfinite(value) else f"{value:.3f}",
+                    ha="center",
+                    va="center",
+                    color=color,
+                    fontsize=8,
+                )
+    if image is not None:
+        fig.colorbar(image, ax=axes.tolist(), label="LPIPS from clean same-seed image", shrink=0.72)
+    fig.suptitle("Q7 causal effect across denoising time and depth")
+    path = figures / "q7_causal_map.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    outputs.append(path)
+
+    # Global/layout versus local/detail change over all available paired cells.
+    condition_rows = {c: [r for r in rows if r["condition"] == c] for c in conditions}
+    x = np.arange(len(conditions))
+    low = [
+        np.mean(_scenario_metric_values(condition_rows[c], "low_frequency_rms")) for c in conditions
+    ]
+    high = [
+        np.mean(_scenario_metric_values(condition_rows[c], "high_frequency_rms"))
+        for c in conditions
+    ]
+    fig, ax = plt.subplots(figsize=(10, 4.8), constrained_layout=True)
+    width = 0.38
+    ax.bar(x - width / 2, low, width, label="Low frequency / layout", color="#4472C4")
+    ax.bar(x + width / 2, high, width, label="High frequency / detail", color="#ED7D31")
+    ax.set_xticks(x, [pretty.get(c, c) for c in conditions], rotation=20, ha="right")
+    ax.set_ylabel("RMS difference from clean image")
+    ax.set_title("Q7 structural versus local image change")
+    ax.legend(frameon=False)
+    ax.spines[["top", "right"]].set_visible(False)
+    path = figures / "q7_frequency_profile.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    outputs.append(path)
+
+    # Paired prompt-fidelity effects. A singleton smoke run remains visibly n=1.
+    fidelity = [
+        metric
+        for metric in ("clip_delta", "image_reward_delta")
+        if _finite_metric_values(rows, metric)
+    ]
+    if fidelity:
+        fig, axes = plt.subplots(
+            1,
+            len(fidelity),
+            figsize=(7.0 * len(fidelity), 4.8),
+            squeeze=False,
+            constrained_layout=True,
+        )
+        for ax, metric in zip(axes[0], fidelity):
+            for yi, condition in enumerate(conditions):
+                values = _scenario_metric_values(condition_rows[condition], metric)
+                stats = paired_bootstrap(values)
+                if not values:
+                    continue
+                ax.errorbar(
+                    stats["mean"],
+                    yi,
+                    xerr=[
+                        [stats["mean"] - stats["ci_low"]],
+                        [stats["ci_high"] - stats["mean"]],
+                    ],
+                    fmt="o",
+                    color="#222222",
+                    capsize=3,
+                )
+                ax.text(stats["mean"], yi + 0.2, f"n={stats['n']}", fontsize=7, ha="center")
+            ax.axvline(0, color="#888888", linewidth=1, linestyle="--")
+            ax.set_yticks(range(len(conditions)), [pretty.get(c, c) for c in conditions])
+            ax.set_xlabel("Edited − clean score")
+            ax.set_title("CLIP" if metric == "clip_delta" else "ImageReward")
+            ax.tick_params(axis="x", labelsize=8)
+            ax.xaxis.set_major_locator(MaxNLocator(5))
+            ax.spines[["top", "right"]].set_visible(False)
+        fig.suptitle("Q7 paired prompt-fidelity effects (95% bootstrap CI)")
+        path = figures / "q7_prompt_fidelity.png"
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        outputs.append(path)
+
+    # Calibrated shared direction: expose whether v* is effectively one channel.
+    calibrated = Path(cfg.vstar_path) if cfg.vstar_path else root / "vstar.npy"
+    if calibrated.exists():
+        vstar = np.load(calibrated)
+        top = np.argsort(np.abs(vstar))[::-1][:12]
+        colors = ["#C00000" if int(i) == cfg.channel else "#5B9BD5" for i in top]
+        fig, ax = plt.subplots(figsize=(9, 4.5), constrained_layout=True)
+        ax.bar(range(len(top)), vstar[top], color=colors)
+        ax.axhline(0, color="#777777", linewidth=0.8)
+        ax.set_xticks(range(len(top)), [str(int(i)) for i in top])
+        ax.set_xlabel("Channel index (top 12 by |loading|)")
+        ax.set_ylabel("v* loading")
+        ax.set_title("Calibrated register direction v*")
+        ax.spines[["top", "right"]].set_visible(False)
+        path = figures / "q7_vstar_loadings.png"
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        outputs.append(path)
+
+    # Representative clean / edited / amplified-difference contact sheet.
+    first = rows[0]
+    representative = [
+        row
+        for row in rows
+        if row.get("prompt_id") == first.get("prompt_id")
+        and row.get("seed") == first.get("seed")
+        and row.get("phase") == first.get("phase")
+        and row.get("zone") == first.get("zone")
+    ]
+    representative.sort(key=lambda row: conditions.index(row["condition"]))
+    image_inputs_exist = representative and all(
+        Path(row["clean_path"]).exists() and Path(row["image_path"]).exists()
+        for row in representative
+    )
+    if image_inputs_exist:
+        tile, header = 256, 42
+        sheet = Image.new("RGB", (3 * tile, len(representative) * (tile + header)), "white")
+        draw = ImageDraw.Draw(sheet)
+        for ri, row in enumerate(representative):
+            clean = Image.open(row["clean_path"]).convert("RGB").resize((tile, tile))
+            edited = Image.open(row["image_path"]).convert("RGB").resize((tile, tile))
+            clean_array = np.asarray(clean, dtype=np.int16)
+            edited_array = np.asarray(edited, dtype=np.int16)
+            difference = Image.fromarray(
+                np.clip(np.abs(clean_array - edited_array) * 4, 0, 255).astype(np.uint8)
+            )
+            y = ri * (tile + header)
+            draw.text((6, y + 4), pretty.get(row["condition"], row["condition"]), fill="black")
+            draw.text((6, y + 21), "clean", fill="#555555")
+            draw.text((tile + 6, y + 21), "edited", fill="#555555")
+            draw.text((2 * tile + 6, y + 21), "|difference| ×4", fill="#555555")
+            sheet.paste(clean, (0, y + header))
+            sheet.paste(edited, (tile, y + header))
+            sheet.paste(difference, (2 * tile, y + header))
+        path = figures / "q7_representative_contact_sheet.png"
+        sheet.save(path)
+        outputs.append(path)
+
+    return outputs
+
+
 def add_paired_prompt_deltas(row: dict[str, Any]) -> None:
     """Add edited-minus-clean effects for every available prompt-fidelity metric."""
     for metric in ("clip", "image_reward"):
@@ -918,6 +1156,8 @@ def evaluate(cfg: Q7Config) -> None:
         w = csv.DictWriter(fh, summary_fields)
         w.writeheader()
         w.writerows(summary_rows)
+    for figure in generate_figures(cfg):
+        print(figure)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -925,6 +1165,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--config", required=True)
     p.add_argument("--smoke", action="store_true")
     p.add_argument("--evaluate", action="store_true")
+    p.add_argument("--plot", action="store_true", help="regenerate figures from paired_metrics.csv")
     p.add_argument("--calibrate-vstar", action="store_true")
     args = p.parse_args(argv)
     cfg = Q7Config.from_json(args.config)
@@ -932,6 +1173,9 @@ def main(argv: list[str] | None = None) -> None:
         print(calibrate_vstar(cfg, smoke=args.smoke))
     elif args.evaluate:
         evaluate(cfg)
+    elif args.plot:
+        for figure in generate_figures(cfg):
+            print(figure)
     else:
         run(cfg, smoke=args.smoke)
 

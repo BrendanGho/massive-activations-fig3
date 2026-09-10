@@ -34,7 +34,9 @@ resolution, and step count are identical within every pair.
 - `paired_metrics.csv`: LPIPS, CLIP, optional ImageReward, low-frequency and high-frequency
   paired distances, plus optional GenEval-style scores supplied by a structured evaluator.
 - `summary.csv` with paired bootstrap confidence intervals by condition, time phase, and zone.
-- Contact sheets that expose clean/intervened/difference images.
+- `figures/q7_causal_map.png` and `q7_frequency_profile.png` for temporal/depth and
+  low-/high-frequency effects, plus paired prompt-fidelity and `vstar` loading plots.
+- A representative contact sheet that exposes clean/intervened/amplified-difference images.
 - Calibration file containing the fitted `vstar` and natural register/sink traces.
 
 ## Acceptance criteria

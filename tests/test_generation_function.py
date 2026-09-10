@@ -1,3 +1,5 @@
+import csv
+
 import numpy as np
 import pytest
 
@@ -11,6 +13,7 @@ from src.experiments.generation_function import (
     audit_counts,
     fit_vstar,
     frequency_distances,
+    generate_figures,
     in_target,
     natural_register_mask,
     paired_bootstrap,
@@ -64,6 +67,76 @@ def test_frequency_split_and_bootstrap():
     assert metrics["low_frequency_rms"] > metrics["high_frequency_rms"]
     stats = paired_bootstrap([1, 2, 3], seed=7, trials=100)
     assert stats["n"] == 3 and stats["ci_low"] <= 2 <= stats["ci_high"]
+
+
+def test_generate_figures_from_smoke_metrics(tmp_path):
+    pytest.importorskip("matplotlib")
+    image_module = pytest.importorskip("PIL.Image")
+    conditions = [
+        "remove_vstar",
+        "suppress_channel_154",
+        "suppress_sink",
+        "remove_top_registers",
+        "norm_only",
+    ]
+    clean_path = tmp_path / "clean.png"
+    edited_path = tmp_path / "edited.png"
+    image_module.fromarray(np.zeros((16, 16, 3), np.uint8)).save(clean_path)
+    image_module.fromarray(np.full((16, 16, 3), 32, np.uint8)).save(edited_path)
+    fields = [
+        "condition",
+        "phase",
+        "zone",
+        "prompt_id",
+        "seed",
+        "clean_path",
+        "image_path",
+        "lpips",
+        "low_frequency_rms",
+        "high_frequency_rms",
+        "clip_delta",
+        "image_reward_delta",
+    ]
+    with (tmp_path / "paired_metrics.csv").open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fields)
+        writer.writeheader()
+        for index, condition in enumerate(conditions, start=1):
+            writer.writerow(
+                {
+                    "condition": condition,
+                    "phase": "early",
+                    "zone": "writer",
+                    "prompt_id": 0,
+                    "seed": 0,
+                    "clean_path": clean_path,
+                    "image_path": edited_path,
+                    "lpips": index / 100,
+                    "low_frequency_rms": index / 200,
+                    "high_frequency_rms": index / 300,
+                    "clip_delta": index / 1000,
+                    "image_reward_delta": "",
+                }
+            )
+    vstar = np.zeros(8, np.float32)
+    vstar[2] = 1
+    np.save(tmp_path / "vstar.npy", vstar)
+    cfg = Q7Config(
+        output_dir=str(tmp_path),
+        prompts=("test",),
+        channel=2,
+        phases={"early": (0, 0)},
+        zones={"writer": (0, 0)},
+        num_steps=1,
+    )
+    outputs = generate_figures(cfg)
+    assert {path.name for path in outputs} == {
+        "q7_causal_map.png",
+        "q7_frequency_profile.png",
+        "q7_prompt_fidelity.png",
+        "q7_vstar_loadings.png",
+        "q7_representative_contact_sheet.png",
+    }
+    assert all(path.stat().st_size > 0 for path in outputs)
 
 
 def test_sink_condition_does_not_edit_residual_reference_operator():

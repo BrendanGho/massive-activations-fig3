@@ -15,6 +15,7 @@ and text/image streams.
 | Cross-model panels | Does norm concentration recur across architectures and layers? | Cached per-model, per-layer panels on a shared prompt and seed |
 | Text/image streams | Which text positions have high norms, and are dominant channels shared with images? | Token-position profiles and within-model channel overlap |
 | Localization baseline | How do selected channels align with foreground pseudo-labels? | Per-layer top/bottom/random-k mIoU |
+| Q7 generation function | What causal role do registers, channel 154, and sink routing play during generation? | Same-seed interventions, perceptual/frequency effects, prompt-fidelity deltas, causal maps |
 
 ## Install and run
 
@@ -262,6 +263,32 @@ T5 hook) and the 1-D visualization are new.
 
 ```bash
 python -m src.experiments text --config configs/highnorm_tokens.yaml --layers all
+```
+
+## Q7 generation-level function
+
+Part 5 of the Colab provides a `Q7_ACTIVE_MODEL` dropdown for `flux-schnell` and
+`flux1-dev`. With `Q7_USE_PRESET_SCHEDULE=True`, selecting the model also selects the
+appropriate denoising schedule: four steps without CFG for Schnell, or 28 steps with
+guidance 3.5 for Dev. The denoising thirds are derived from that step count automatically.
+The Q7 hooks and writer/register/dissolution zones are FLUX.1-specific; PixArt-Sigma and
+FLUX.2 are therefore intentionally not offered by this selector.
+
+Evaluation writes `paired_metrics.csv`, `summary.csv`, and these figures under
+`<Q7_OUTPUT_DIR>/figures/`:
+
+- `q7_causal_map.png` — LPIPS heatmaps across phase and depth for every intervention.
+- `q7_frequency_profile.png` — low-frequency/layout versus high-frequency/detail change.
+- `q7_prompt_fidelity.png` — paired CLIP and, when available, ImageReward deltas with
+  bootstrap intervals and visible sample counts.
+- `q7_vstar_loadings.png` — the largest calibrated `v*` channel coefficients.
+- `q7_representative_contact_sheet.png` — clean, edited, and amplified-difference images.
+
+Figures are generated automatically by `--evaluate`. They can be regenerated without a
+model or GPU after changing plotting code:
+
+```bash
+python -m src.experiments.generation_function --config configs/q7_colab.json --plot
 ```
 
 ## Colab storage
