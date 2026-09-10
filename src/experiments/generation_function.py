@@ -187,9 +187,60 @@ def paired_bootstrap(
     }
 
 
+def add_paired_prompt_deltas(row: dict[str, Any]) -> None:
+    """Add edited-minus-clean effects for every available prompt-fidelity metric."""
+    for metric in ("clip", "image_reward"):
+        clean, edited = row.get(f"{metric}_clean"), row.get(f"{metric}_edited")
+        row[f"{metric}_delta"] = (
+            None if clean is None or edited is None else float(edited) - float(clean)
+        )
+
+
 def config_hash(cfg: Q7Config) -> str:
     payload = json.dumps(asdict(cfg), sort_keys=True, separators=(",", ":"), default=list)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def file_sha256(path: str | os.PathLike[str]) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run_identity(
+    cfg: Q7Config, calibration_sha256: str, scheduler_config: dict[str, Any] | None = None
+) -> str:
+    scheduler_json = json.dumps(scheduler_config or {}, sort_keys=True, separators=(",", ":"))
+    payload = f"{config_hash(cfg)}:{calibration_sha256}:{scheduler_json}"
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def expected_target_fires(
+    n_steps: int, phase: tuple[int, int], zone: tuple[int, int], layer: int
+) -> int:
+    if not zone[0] <= layer <= zone[1]:
+        return 0
+    lo, hi = max(0, phase[0]), min(n_steps - 1, phase[1])
+    return max(0, hi - lo + 1)
+
+
+def audit_counts(
+    calls: dict[int, int],
+    fires: dict[int, int],
+    n_steps: int,
+    phase: tuple[int, int],
+    zone: tuple[int, int],
+) -> dict[str, Any]:
+    errors = []
+    for layer in sorted(calls):
+        if calls[layer] != n_steps:
+            errors.append(f"layer {layer}: {calls[layer]} calls != {n_steps}")
+        expected = expected_target_fires(n_steps, phase, zone, layer)
+        if fires.get(layer, 0) != expected:
+            errors.append(f"layer {layer}: {fires.get(layer, 0)} fires != {expected}")
+    return {"ok": not errors, "errors": errors, "calls": calls, "fires": fires}
 
 
 def _torch_edit(x, condition: str, mask_np: np.ndarray, vstar, channel: int):
@@ -240,12 +291,14 @@ def _modify_image_output(output: Any, n_image: int, fn):
 
 
 class NaturalTrace:
-    """Clean-run masks and register vectors keyed by (step, layer)."""
+    """Clean-run register masks, vectors, and per-head attention sinks."""
 
     def __init__(self, threshold: float, max_registers: int):
         self.threshold, self.max_registers = threshold, max_registers
         self.masks: dict[tuple[int, int], np.ndarray] = {}
+        self.sink_indices: dict[tuple[int, int], np.ndarray] = {}
         self.vectors: list[np.ndarray] = []
+        self.n_image: int | None = None
 
     def observe(self, step: int, layer: int, x) -> None:
         arr = x[-1].detach().float().cpu().numpy()
@@ -254,6 +307,168 @@ class NaturalTrace:
         if mask.any():
             self.vectors.extend(arr[mask])
 
+    def observe_sinks(self, step: int, layer: int, indices: np.ndarray) -> None:
+        self.sink_indices[(step, layer)] = np.asarray(indices, dtype=np.int64)
+
+
+def _flux_qkv(attn, hidden_states, encoder_hidden_states, image_rotary_emb):
+    """Construct the normalized, rotary-applied Q/K and V used by FLUX attention."""
+    import torch
+    from diffusers.models.embeddings import apply_rotary_emb
+
+    if getattr(attn, "fused_projections", False):
+        query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
+        if encoder_hidden_states is not None:
+            encoder_query, encoder_key, encoder_value = attn.to_added_qkv(
+                encoder_hidden_states
+            ).chunk(3, dim=-1)
+    else:
+        query, key, value = (
+            attn.to_q(hidden_states),
+            attn.to_k(hidden_states),
+            attn.to_v(hidden_states),
+        )
+        if encoder_hidden_states is not None:
+            encoder_query = attn.add_q_proj(encoder_hidden_states)
+            encoder_key = attn.add_k_proj(encoder_hidden_states)
+            encoder_value = attn.add_v_proj(encoder_hidden_states)
+    query = attn.norm_q(query.unflatten(-1, (attn.heads, -1)))
+    key = attn.norm_k(key.unflatten(-1, (attn.heads, -1)))
+    value = value.unflatten(-1, (attn.heads, -1))
+    if encoder_hidden_states is not None:
+        encoder_query = attn.norm_added_q(encoder_query.unflatten(-1, (attn.heads, -1)))
+        encoder_key = attn.norm_added_k(encoder_key.unflatten(-1, (attn.heads, -1)))
+        encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+        query = torch.cat([encoder_query, query], dim=1)
+        key = torch.cat([encoder_key, key], dim=1)
+        value = torch.cat([encoder_value, value], dim=1)
+    if image_rotary_emb is not None:
+        query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+        key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+    return query, key, value
+
+
+def _incoming_image_attention_sinks(query, key, n_image: int, chunk_size: int = 128):
+    """Exact per-head sink under paper's image-key-renormalized incoming-attention metric."""
+    import torch
+
+    query = query[:, -n_image:].float()
+    key = key[:, -n_image:].float()
+    incoming = torch.zeros(
+        (query.shape[0], query.shape[2], n_image), device=query.device, dtype=torch.float32
+    )
+    scale = query.shape[-1] ** -0.5
+    for lo in range(0, n_image, chunk_size):
+        q = query[:, lo : lo + chunk_size]
+        scores = torch.einsum("bqhd,bkhd->bhqk", q, key) * scale
+        incoming += scores.softmax(dim=-1).sum(dim=2)
+    # Last row is the conditional branch under the same convention as residual capture.
+    return incoming[-1].argmax(dim=-1).detach().cpu().numpy()
+
+
+class AttentionSinkTraceProcessor:
+    """Delegating processor that records clean per-head image-to-image sink identities."""
+
+    def __init__(self, original, trace: NaturalTrace, layer: int, counter: dict[int, int]):
+        self.original, self.trace, self.layer, self.counter = original, trace, layer, counter
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        image_rotary_emb=None,
+        **kwargs,
+    ):
+        if self.trace.n_image is None:
+            raise RuntimeError("image-token count unavailable before attention trace")
+        step = self.counter[self.layer]
+        self.counter[self.layer] += 1
+        query, key, _value = _flux_qkv(attn, hidden_states, encoder_hidden_states, image_rotary_emb)
+        sinks = _incoming_image_attention_sinks(query, key, self.trace.n_image)
+        self.trace.observe_sinks(step, self.layer, sinks)
+        return self.original(
+            attn,
+            hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=attention_mask,
+            image_rotary_emb=image_rotary_emb,
+            **kwargs,
+        )
+
+
+def _suppressed_image_attention(query, key, value, n_image: int, sinks, chunk_size: int = 128):
+    """Recompute image-query rows over all keys, masking one natural sink per head."""
+    import torch
+
+    image_query = query[:, -n_image:].float()
+    key_float, value_float = key.float(), value.float()
+    scale = image_query.shape[-1] ** -0.5
+    sinks = torch.as_tensor(sinks, device=query.device, dtype=torch.long)
+    key_offset = key.shape[1] - n_image
+    heads = torch.arange(query.shape[2], device=query.device)
+    chunks = []
+    for lo in range(0, n_image, chunk_size):
+        q = image_query[:, lo : lo + chunk_size]
+        scores = torch.einsum("bqhd,bkhd->bhqk", q, key_float) * scale
+        scores[:, heads, :, key_offset + sinks] = torch.finfo(scores.dtype).min
+        probs = scores.softmax(dim=-1)
+        chunk = torch.einsum("bhqk,bkhd->bqhd", probs, value_float)
+        chunks.append(chunk)
+    return torch.cat(chunks, dim=1).to(query.dtype)
+
+
+class SinkSuppressProcessor:
+    """Delegating processor that changes image-query routing and preserves text-query output."""
+
+    def __init__(self, original, trace, layer, phase, zone, counts, fires):
+        self.original, self.trace, self.layer = original, trace, layer
+        self.phase, self.zone, self.counts, self.fires = phase, zone, counts, fires
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        image_rotary_emb=None,
+        **kwargs,
+    ):
+        output = self.original(
+            attn,
+            hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=attention_mask,
+            image_rotary_emb=image_rotary_emb,
+            **kwargs,
+        )
+        step = self.counts[self.layer]
+        self.counts[self.layer] += 1
+        if not in_target(step, self.layer, self.phase, self.zone):
+            return output
+        if attention_mask is not None:
+            raise RuntimeError("suppress_sink does not support a pre-existing attention mask")
+        sinks = self.trace.sink_indices.get((step, self.layer))
+        if sinks is None:
+            raise RuntimeError(f"clean attention trace missing step {step}, layer {self.layer}")
+        if self.trace.n_image is None:
+            raise RuntimeError("clean trace has no image-token count")
+        query, key, value = _flux_qkv(attn, hidden_states, encoder_hidden_states, image_rotary_emb)
+        image = _suppressed_image_attention(query, key, value, self.trace.n_image, sinks)
+        image = image.flatten(2, 3).to(query.dtype)
+        if encoder_hidden_states is not None:
+            # Double-stream processor output is (projected image, projected text).
+            image = attn.to_out[0](image.contiguous())
+            image = attn.to_out[1](image)
+            result = (image, output[1])
+        else:
+            # Single-stream processor output is unprojected [text,image]; replace only image rows.
+            result = output.clone()
+            result[:, -self.trace.n_image :, :] = image
+        self.fires[self.layer] += 1
+        return result
+
 
 class ResidualInterventionHooks:
     """Post-block hooks using masks fixed by the paired clean run."""
@@ -261,7 +476,7 @@ class ResidualInterventionHooks:
     def __init__(self, blocks, trace, condition, phase, zone, vstar, channel, n_steps):
         self.blocks, self.trace, self.condition = blocks, trace, condition
         self.phase, self.zone, self.vstar, self.channel = phase, zone, vstar, channel
-        self.n_steps, self.counts, self.handles = n_steps, {}, []
+        self.n_steps, self.counts, self.fires, self.handles = n_steps, {}, {}, []
 
     def attach(self, transformer):
         def pre(_m, _a, kw):
@@ -271,6 +486,7 @@ class ResidualInterventionHooks:
         self.handles.append(transformer.register_forward_pre_hook(pre, with_kwargs=True))
         for ref in self.blocks:
             self.counts[ref.layer_id] = 0
+            self.fires[ref.layer_id] = 0
 
             def hook(_m, _a, out, layer=ref.layer_id):
                 step = self.counts[layer]
@@ -287,6 +503,7 @@ class ResidualInterventionHooks:
                 )
                 if not found:
                     raise RuntimeError(f"image output not found at layer {layer}")
+                self.fires[layer] += 1
                 return new
 
             self.handles.append(ref.module.register_forward_hook(hook))
@@ -297,70 +514,45 @@ class ResidualInterventionHooks:
             handle.remove()
         self.handles.clear()
 
+    def audit(self):
+        return audit_counts(self.counts, self.fires, self.n_steps, self.phase, self.zone)
+
 
 class SinkAttentionHooks:
-    """Mask incoming attention to clean-run natural register/sink keys.
-
-    FLUX attention concatenates text keys before image keys.  The hook supplies an additive
-    key mask to each targeted block's ``Attention.forward``; the block input and residual skip
-    are never edited.  This relies on the public ``attention_mask`` argument and validates it
-    before attachment so API drift fails during the smoke test.
-    """
+    """Replace FLUX processors temporarily to suppress clean-traced natural sink routing."""
 
     def __init__(self, blocks, trace, phase, zone, n_steps):
         self.blocks, self.trace, self.phase, self.zone = blocks, trace, phase, zone
-        self.n_steps, self.counts, self.handles = n_steps, {}, []
+        self.n_steps, self.counts, self.fires, self.originals = n_steps, {}, {}, []
 
     def attach(self):
-        import inspect
-        import torch
-
         for ref in self.blocks:
             attn = getattr(ref.module, "attn", None)
-            if attn is None:
-                raise RuntimeError(f"block {ref.layer_id} has no .attn module")
-            if "attention_mask" not in inspect.signature(attn.forward).parameters:
-                raise RuntimeError(
-                    f"{type(attn).__name__}.forward lacks attention_mask; pin a compatible "
-                    "diffusers version before running sink suppression"
-                )
+            if attn is None or not hasattr(attn, "processor") or not hasattr(attn, "set_processor"):
+                raise RuntimeError(f"block {ref.layer_id} has no replaceable attention processor")
             self.counts[ref.layer_id] = 0
-
-            def pre(_module, args, kwargs, layer=ref.layer_id):
-                step = self.counts[layer]
-                self.counts[layer] += 1
-                if not in_target(step, layer, self.phase, self.zone):
-                    return None
-                mask_np = self.trace.masks.get((step, layer))
-                if mask_np is None:
-                    raise RuntimeError(f"clean trace missing step {step}, layer {layer}")
-                hidden = kwargs.get("hidden_states", args[0] if args else None)
-                encoder = kwargs.get("encoder_hidden_states")
-                if hidden is None or hidden.ndim != 3:
-                    raise RuntimeError(f"unexpected attention input at layer {layer}")
-                # Joint FLUX attention orders encoder/text then hidden/image. Single-stream
-                # attention already receives the concatenated sequence, with image tokens last.
-                n_img = int(mask_np.size)
-                total = int(hidden.shape[1] + (encoder.shape[1] if encoder is not None else 0))
-                offset = total - n_img
-                additive = torch.zeros(
-                    (hidden.shape[0], 1, 1, total), device=hidden.device, dtype=hidden.dtype
+            self.fires[ref.layer_id] = 0
+            self.originals.append((attn, attn.processor))
+            attn.set_processor(
+                SinkSuppressProcessor(
+                    attn.processor,
+                    self.trace,
+                    ref.layer_id,
+                    self.phase,
+                    self.zone,
+                    self.counts,
+                    self.fires,
                 )
-                sink_idx = torch.as_tensor(np.flatnonzero(mask_np), device=hidden.device)
-                additive[..., offset + sink_idx] = torch.finfo(hidden.dtype).min
-                prior = kwargs.get("attention_mask")
-                if prior is not None:
-                    additive = additive + prior.to(device=hidden.device, dtype=hidden.dtype)
-                kwargs["attention_mask"] = additive
-                return args, kwargs
-
-            self.handles.append(attn.register_forward_pre_hook(pre, with_kwargs=True))
+            )
         return self
 
     def detach(self):
-        for handle in self.handles:
-            handle.remove()
-        self.handles.clear()
+        for attn, processor in self.originals:
+            attn.set_processor(processor)
+        self.originals.clear()
+
+    def audit(self):
+        return audit_counts(self.counts, self.fires, self.n_steps, self.phase, self.zone)
 
 
 def _generate(pipe, cfg: Q7Config, prompt: str, seed: int):
@@ -382,17 +574,31 @@ def _generate(pipe, cfg: Q7Config, prompt: str, seed: int):
         return pipe(**kwargs).images[0]
 
 
-def _trace_clean(pipe, blocks, cfg, prompt, seed):
+def _trace_clean(pipe, blocks, cfg, prompt, seed, capture_sinks: bool = True):
     trace = NaturalTrace(cfg.register_threshold, cfg.max_registers)
     counters = {b.layer_id: 0 for b in blocks}
     state = {"n_image": None}
     handles = []
+    original_processors = []
+    sink_layers = {layer for lo, hi in cfg.zones.values() for layer in range(int(lo), int(hi) + 1)}
+    attention_counters = {b.layer_id: 0 for b in blocks if b.layer_id in sink_layers}
 
     def pre(_m, _a, kw):
         state["n_image"] = int(kw["hidden_states"].shape[1])
+        trace.n_image = state["n_image"]
 
     handles.append(pipe.transformer.register_forward_pre_hook(pre, with_kwargs=True))
     for ref in blocks:
+        if capture_sinks and ref.layer_id in sink_layers:
+            attn = getattr(ref.module, "attn", None)
+            if attn is None or not hasattr(attn, "processor") or not hasattr(attn, "set_processor"):
+                raise RuntimeError(
+                    f"block {ref.layer_id} does not expose a replaceable attention processor"
+                )
+            original_processors.append((attn, attn.processor))
+            attn.set_processor(
+                AttentionSinkTraceProcessor(attn.processor, trace, ref.layer_id, attention_counters)
+            )
 
         def hook(_m, _a, out, layer=ref.layer_id):
             step = counters[layer]
@@ -412,6 +618,14 @@ def _trace_clean(pipe, blocks, cfg, prompt, seed):
     finally:
         for h in handles:
             h.remove()
+        for attn, processor in original_processors:
+            attn.set_processor(processor)
+    if capture_sinks:
+        bad = {
+            layer: count for layer, count in attention_counters.items() if count != cfg.num_steps
+        }
+        if bad:
+            raise RuntimeError(f"clean attention trace call-count mismatch: {bad}")
     return image, trace
 
 
@@ -436,7 +650,7 @@ def calibrate_vstar(cfg: Q7Config, smoke: bool = False) -> Path:
         jobs = jobs[:1]
     vectors = []
     for prompt, seed in jobs:
-        _image, trace = _trace_clean(pipe, blocks, cfg, prompt, seed)
+        _image, trace = _trace_clean(pipe, blocks, cfg, prompt, seed, capture_sinks=False)
         vectors.extend(trace.vectors)
     if not vectors:
         raise RuntimeError("no natural register vectors found during vstar calibration")
@@ -464,30 +678,68 @@ def run(cfg: Q7Config, smoke: bool = False) -> None:
     blocks = discover_blocks(pipe.transformer)
     out = Path(cfg.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    calibrated = Path(cfg.vstar_path) if cfg.vstar_path else out / "vstar.npy"
+    if not calibrated.exists():
+        raise FileNotFoundError(
+            f"calibrated vstar not found at {calibrated}; run --calibrate-vstar first"
+        )
+    scheduler_config = json.loads(json.dumps(dict(pipe.scheduler.config), default=str))
+    calibration_sha = file_sha256(calibrated)
+    identity = run_identity(cfg, calibration_sha, scheduler_config)
+    generation_params = {
+        "model_ckpt": cfg.model_ckpt,
+        "resolution": cfg.resolution,
+        "num_steps": cfg.num_steps,
+        "guidance_scale": cfg.guidance_scale,
+        "dtype": cfg.dtype,
+        "device": cfg.device,
+        "offload": cfg.offload,
+        "scheduler_class": type(pipe.scheduler).__name__,
+        "scheduler_config": scheduler_config,
+        "calibration_path": str(calibrated),
+        "calibration_sha256": calibration_sha,
+    }
     manifest = out / "runs.jsonl"
     completed = set()
     if manifest.exists():
         for line in manifest.read_text(encoding="utf-8").splitlines():
             old = json.loads(line)
+            if old.get("run_identity") != identity or not Path(old.get("image_path", "")).exists():
+                continue
             completed.add(
-                (old["prompt_id"], old["seed"], old["condition"], old["phase"], old["zone"])
+                (
+                    old["run_identity"],
+                    old["prompt_id"],
+                    old["prompt"],
+                    old["seed"],
+                    old["condition"],
+                    old["phase"],
+                    old["zone"],
+                )
             )
     jobs = [(p, s) for p in cfg.prompts for s in cfg.seeds]
     if smoke:
         jobs = jobs[:1]
     for prompt_id, (prompt, seed) in enumerate(jobs):
         clean, trace = _trace_clean(pipe, blocks, cfg, prompt, seed)
-        clean_path = out / "images" / f"p{prompt_id:03d}_s{seed}_baseline.png"
+        clean_path = out / "images" / f"{identity}_p{prompt_id:03d}_s{seed}_baseline.png"
         _save_image(clean, clean_path)
-        calibrated = Path(cfg.vstar_path) if cfg.vstar_path else out / "vstar.npy"
-        vstar = np.load(calibrated) if calibrated.exists() else fit_vstar(np.asarray(trace.vectors))
+        vstar = np.load(calibrated)
         phase_items = list(cfg.phases.items())[:1] if smoke else list(cfg.phases.items())
         zone_items = list(cfg.zones.items())[:1] if smoke else list(cfg.zones.items())
         for phase_name, phase in phase_items:
             for zone_name, zone in zone_items:
                 conditions = [c for c in cfg.conditions if c != "baseline"]
                 for condition in conditions:
-                    job_key = (prompt_id, seed, condition, phase_name, zone_name)
+                    job_key = (
+                        identity,
+                        prompt_id,
+                        prompt,
+                        seed,
+                        condition,
+                        phase_name,
+                        zone_name,
+                    )
                     if job_key in completed:
                         continue
                     if condition == "suppress_sink":
@@ -509,7 +761,15 @@ def run(cfg: Q7Config, smoke: bool = False) -> None:
                         image = _generate(pipe, cfg, prompt, seed)
                     finally:
                         hooks.detach()
-                    stem = f"p{prompt_id:03d}_s{seed}_{condition}_{phase_name}_{zone_name}"
+                    audit = hooks.audit()
+                    if not audit["ok"]:
+                        raise RuntimeError(
+                            f"intervention audit failed for {condition}/{phase_name}/{zone_name}: "
+                            + "; ".join(audit["errors"])
+                        )
+                    stem = (
+                        f"{identity}_p{prompt_id:03d}_s{seed}_{condition}_{phase_name}_{zone_name}"
+                    )
                     image_path = out / "images" / f"{stem}.png"
                     _save_image(image, image_path)
                     row = dict(
@@ -522,13 +782,15 @@ def run(cfg: Q7Config, smoke: bool = False) -> None:
                         clean_path=str(clean_path),
                         image_path=str(image_path),
                         config_hash=config_hash(cfg),
-                        hook_counts=hooks.counts,
+                        run_identity=identity,
+                        generation_params=generation_params,
+                        intervention_audit=audit,
                     )
                     with manifest.open("a", encoding="utf-8") as fh:
                         fh.write(json.dumps(row, sort_keys=True) + "\n")
 
 
-def evaluate(output_dir: str) -> None:
+def evaluate(cfg: Q7Config) -> None:
     """Compute paired perceptual, prompt-fidelity, and frequency-band metrics.
 
     LPIPS, OpenCLIP, and ImageReward are optional: absent packages produce explicit blank
@@ -536,7 +798,25 @@ def evaluate(output_dir: str) -> None:
     """
     from PIL import Image
 
-    root = Path(output_dir)
+    root = Path(cfg.output_dir)
+    calibrated = Path(cfg.vstar_path) if cfg.vstar_path else root / "vstar.npy"
+    if not calibrated.exists():
+        raise FileNotFoundError(f"calibrated vstar not found at {calibrated}")
+    calibration_sha = file_sha256(calibrated)
+    manifest_rows = [
+        json.loads(line) for line in (root / "runs.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    identities = {
+        row["run_identity"]
+        for row in manifest_rows
+        if row.get("config_hash") == config_hash(cfg)
+        and row.get("generation_params", {}).get("calibration_sha256") == calibration_sha
+    }
+    if len(identities) != 1:
+        raise RuntimeError(
+            f"expected exactly one compatible run identity, found {sorted(identities)}"
+        )
+    identity = identities.pop()
     rows = []
     lpips_model = clip_model = clip_preprocess = clip_tokenizer = reward_model = None
     try:
@@ -561,8 +841,9 @@ def evaluate(output_dir: str) -> None:
         reward_model = RM.load("ImageReward-v1.0")
     except ImportError:
         pass
-    for line in (root / "runs.jsonl").read_text(encoding="utf-8").splitlines():
-        row = json.loads(line)
+    for row in manifest_rows:
+        if row.get("run_identity") != identity:
+            continue
         clean_pil = Image.open(row["clean_path"]).convert("RGB")
         edited_pil = Image.open(row["image_path"]).convert("RGB")
         clean, edited = np.asarray(clean_pil), np.asarray(edited_pil)
@@ -571,8 +852,10 @@ def evaluate(output_dir: str) -> None:
             lpips=None,
             clip_clean=None,
             clip_edited=None,
+            clip_delta=None,
             image_reward_clean=None,
             image_reward_edited=None,
+            image_reward_delta=None,
         )
         if lpips_model is not None:
             import torch
@@ -595,6 +878,7 @@ def evaluate(output_dir: str) -> None:
         if reward_model is not None:
             row["image_reward_clean"] = float(reward_model.score(row["prompt"], row["clean_path"]))
             row["image_reward_edited"] = float(reward_model.score(row["prompt"], row["image_path"]))
+        add_paired_prompt_deltas(row)
         rows.append(row)
     fields = sorted({k for r in rows for k in r if k != "hook_counts"})
     with (root / "paired_metrics.csv").open("w", newline="", encoding="utf-8") as fh:
@@ -608,8 +892,8 @@ def evaluate(output_dir: str) -> None:
         "low_frequency_rms",
         "high_frequency_rms",
         "low_high_ratio",
-        "clip_edited",
-        "image_reward_edited",
+        "clip_delta",
+        "image_reward_delta",
     ]
     grouped: dict[tuple[str, str, str, str], list[float]] = {}
     for row in rows:
@@ -647,7 +931,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.calibrate_vstar:
         print(calibrate_vstar(cfg, smoke=args.smoke))
     elif args.evaluate:
-        evaluate(cfg.output_dir)
+        evaluate(cfg)
     else:
         run(cfg, smoke=args.smoke)
 

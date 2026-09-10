@@ -16,8 +16,9 @@ Conditions:
 - `remove_vstar`: subtract the projection onto a calibrated unit direction only at natural
   register tokens.
 - `suppress_channel_154`: zero channel 154 for every image token.
-- `suppress_sink`: block image queries from attending to the natural sink key while leaving the
-  residual token unchanged.
+- `suppress_sink`: trace the strongest natural image key separately for every attention head
+  using image-key-renormalized incoming attention, then block image queries from attending to
+  that head's sink while leaving text-query routing and the residual token unchanged.
 - `remove_top_registers`: zero the complete residual vectors of the highest-norm natural
   register tokens.
 - `norm_only`: scale natural register vectors to the ordinary-token median norm while preserving
@@ -43,8 +44,8 @@ resolution, and step count are identical within every pair.
 - Phase and depth targeting are inclusive, deterministic, and fire only in the requested cells.
 - Register masks are selected from the clean trace with the paper's 3x-median, top-8 rule.
 - Sink suppression edits attention routing only; it does not overwrite the residual-stream token.
-- A smoke mode runs baseline plus one condition and audits hook fire counts before a full run.
+- A smoke mode runs one baseline plus every condition in one phase/zone and asserts both total
+  forward counts and actual targeted edit counts before a full run.
 - Every generated pair records all generation parameters and hashes the experiment config.
 - CPU tests cover the operators, targeting, metrics, and paired aggregation without importing
   diffusers or downloading model weights.
-

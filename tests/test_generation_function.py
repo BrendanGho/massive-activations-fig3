@@ -1,12 +1,20 @@
 import numpy as np
+import pytest
 
 from src.experiments.generation_function import (
+    NaturalTrace,
+    Q7Config,
+    SinkSuppressProcessor,
+    _suppressed_image_attention,
+    add_paired_prompt_deltas,
     apply_numpy_intervention,
+    audit_counts,
     fit_vstar,
     frequency_distances,
     in_target,
     natural_register_mask,
     paired_bootstrap,
+    run_identity,
 )
 
 
@@ -62,3 +70,82 @@ def test_sink_condition_does_not_edit_residual_reference_operator():
     x = np.arange(12, dtype=np.float32).reshape(3, 4)
     y = apply_numpy_intervention(x, "suppress_sink", np.array([0, 1, 0], bool))
     assert np.array_equal(x, y) and y is not x
+
+
+def test_attention_sinks_are_traced_separately_from_registers():
+    trace = NaturalTrace(3.0, 8)
+    trace.masks[(1, 2)] = np.array([True, False, False])
+    trace.observe_sinks(1, 2, np.array([2, 1]))
+    assert trace.sink_indices[(1, 2)].tolist() == [2, 1]
+    assert trace.masks[(1, 2)].tolist() == [True, False, False]
+
+
+def test_audit_checks_calls_and_actual_target_fires():
+    calls = {0: 5, 1: 5, 2: 5}
+    fires = {0: 0, 1: 3, 2: 0}
+    assert audit_counts(calls, fires, 5, (1, 3), (1, 1))["ok"]
+    bad = audit_counts(calls, {**fires, 1: 5}, 5, (1, 3), (1, 1))
+    assert not bad["ok"] and "fires" in bad["errors"][0]
+
+
+def test_run_identity_changes_with_calibration_and_scheduler():
+    cfg = Q7Config(prompts=("p",))
+    base = run_identity(cfg, "aaa", {"name": "one"})
+    assert base != run_identity(cfg, "bbb", {"name": "one"})
+    assert base != run_identity(cfg, "aaa", {"name": "two"})
+
+
+def test_prompt_fidelity_effects_are_edited_minus_clean():
+    row = {
+        "clip_clean": 0.5,
+        "clip_edited": 0.4,
+        "image_reward_clean": 1.0,
+        "image_reward_edited": 1.25,
+    }
+    add_paired_prompt_deltas(row)
+    assert np.isclose(row["clip_delta"], -0.1)
+    assert np.isclose(row["image_reward_delta"], 0.25)
+
+
+def test_sink_suppression_is_per_head():
+    torch = pytest.importorskip("torch")
+    query = torch.ones(1, 2, 2, 1)
+    key = torch.ones(1, 3, 2, 1)
+    value = torch.tensor([[[[100.0], [100.0]], [[1.0], [10.0]], [[2.0], [20.0]]]])
+    result = _suppressed_image_attention(query, key, value, n_image=2, sinks=[0, 1])
+    # Head 0 suppresses image key 0; head 1 suppresses image key 1. Text remains available.
+    assert result.shape == (1, 2, 2, 1)
+    assert not torch.allclose(result[:, :, 0], result[:, :, 1])
+
+
+def test_sink_processor_preserves_double_stream_text_output_identity():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
+
+    class FakeAttention:
+        heads = 2
+        fused_projections = False
+
+        def __init__(self):
+            self.to_q = self.to_k = self.to_v = lambda x: x
+            self.add_q_proj = self.add_k_proj = self.add_v_proj = lambda x: x
+            self.norm_q = self.norm_k = lambda x: x
+            self.to_out = [lambda x: x, lambda x: x]
+
+    text_sentinel = torch.randn(1, 1, 2)
+
+    def original(_attn, hidden, **_kwargs):
+        return torch.zeros_like(hidden), text_sentinel
+
+    trace = NaturalTrace(3.0, 8)
+    trace.n_image = 2
+    trace.observe_sinks(0, 1, np.array([0, 1]))
+    counts, fires = {1: 0}, {1: 0}
+    processor = SinkSuppressProcessor(original, trace, 1, (0, 0), (1, 1), counts, fires)
+    output = processor(
+        FakeAttention(),
+        torch.randn(1, 2, 2),
+        encoder_hidden_states=torch.randn(1, 1, 2),
+    )
+    assert output[1] is text_sentinel
+    assert counts[1] == 1 and fires[1] == 1
