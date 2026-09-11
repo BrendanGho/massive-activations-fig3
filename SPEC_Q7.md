@@ -30,6 +30,11 @@ Cross each condition with early/middle/late denoising thirds and writer/early-re
 mid-register/dissolution depth zones. Prompt, seed, initial generator state, scheduler, guidance,
 resolution, and step count are identical within every pair.
 
+The confirmatory configuration uses the full Cartesian product. The optional exploratory screen
+uses a preregistered cross: all three phases at `mid_register`, plus all four zones at `middle`
+(six unique cells). It estimates main temporal/depth patterns cheaply but is not evidence that
+unmeasured phase-by-depth interactions are absent.
+
 FLUX.1 uses its 57-block joint-attention layout and register zones 18-39. PixArt-Sigma uses its
 28 image-only DiT blocks, block 13 as the writer, and the shorter 13-20 register interval. Because
 PixArt uses real CFG, interventions edit only the conditional (last) row of `[uncond, cond]`.
@@ -45,7 +50,11 @@ PixArt uses real CFG, interventions edit only the conditional (last) row of `[un
 - `figures/q7_causal_map.png` and `q7_frequency_profile.png` for temporal/depth and
   low-/high-frequency effects, plus paired prompt-fidelity and `vstar` loading plots.
 - A representative contact sheet that exposes clean/intervened/amplified-difference images.
-- Calibration file containing the fitted `vstar` and natural register/sink traces.
+- Calibration file containing the fitted `vstar` and its audit metadata; natural register/sink
+  traces are paired in memory with each scenario and are not serialized.
+- In Colab, the full image grid is temporary under `/content`; compact metrics, audit metadata,
+  `vstar`, and figures may be exported to Drive, but raw activation traces and the image grid are
+  not copied.
 
 ## Acceptance criteria
 
@@ -63,5 +72,8 @@ PixArt uses real CFG, interventions edit only the conditional (last) row of `[un
 - A smoke mode runs one baseline plus every condition in one phase/zone and asserts both total
   forward counts and actual targeted edit counts before a full run.
 - Every generated pair records all generation parameters and hashes the experiment config.
+- Prompt conditioning is cached per unique prompt without changing its tensors, and combined
+  calibration/run mode reuses one loaded pipeline. Resume skips a scenario only when every
+  requested run cell and its clean image exist for the exact run identity.
 - CPU tests cover the operators, targeting, metrics, and paired aggregation without importing
   diffusers or downloading model weights.

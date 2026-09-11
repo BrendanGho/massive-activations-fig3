@@ -1,14 +1,18 @@
 import csv
+import hashlib
+import json
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from src.experiments.generation_function import (
+    EXPERIMENT_REVISION,
     NaturalTrace,
     PixArtSinkSuppressProcessor,
     Q7Config,
     SinkSuppressProcessor,
+    _conditioning_for_prompt,
     _dispatch_suppressed_image_attention,
     _infer_image_token_count,
     _suppressed_image_attention,
@@ -16,6 +20,8 @@ from src.experiments.generation_function import (
     add_paired_prompt_deltas,
     apply_numpy_intervention,
     audit_counts,
+    calibration_is_compatible,
+    config_hash,
     denoising_thirds,
     fit_vstar,
     frequency_distances,
@@ -25,6 +31,8 @@ from src.experiments.generation_function import (
     natural_register_mask,
     paired_bootstrap,
     run_identity,
+    run_is_complete,
+    selected_grid_cells,
     validate_flux1_layout,
     validate_model_layout,
 )
@@ -48,6 +56,111 @@ def test_denoising_thirds_are_exhaustive_for_q7_presets():
         "middle": (7, 12),
         "late": (13, 19),
     }
+
+
+def test_selected_grid_cells_supports_screen_full_and_smoke():
+    cfg = Q7Config(
+        prompts=("p",),
+        grid_cells=(("early", "mid_register"), ("middle", "writer")),
+    )
+    assert selected_grid_cells(cfg) == [
+        ("early", "mid_register"),
+        ("middle", "writer"),
+    ]
+    assert selected_grid_cells(cfg, smoke=True) == [("early", "writer")]
+    full = Q7Config(prompts=("p",))
+    assert len(selected_grid_cells(full)) == 12
+
+
+def test_prompt_conditioning_is_cached_for_flux():
+    torch = pytest.importorskip("torch")
+
+    class FakePipe:
+        _execution_device = "cpu"
+
+        def __init__(self):
+            self.calls = 0
+
+        def encode_prompt(self, **_kwargs):
+            self.calls += 1
+            return torch.ones(1, 2, 3), torch.ones(1, 3), torch.zeros(2, 3)
+
+    pipe = FakePipe()
+    cfg = Q7Config(prompts=("p",))
+    cache = {}
+    first = _conditioning_for_prompt(pipe, cfg, "p", cache)
+    second = _conditioning_for_prompt(pipe, cfg, "p", cache)
+    assert first is second
+    assert pipe.calls == 1
+    assert set(first) == {"prompt_embeds", "pooled_prompt_embeds"}
+
+
+def test_prompt_conditioning_uses_pixart_cfg_contract():
+    torch = pytest.importorskip("torch")
+
+    class FakePipe:
+        _execution_device = "cpu"
+
+        def encode_prompt(self, **kwargs):
+            self.kwargs = kwargs
+            return tuple(torch.full((1,), value) for value in range(4))
+
+    pipe = FakePipe()
+    cfg = Q7Config(prompts=("p",), model_family="pixart_sigma", guidance_scale=4.5)
+    result = _conditioning_for_prompt(pipe, cfg, "p", {})
+    assert pipe.kwargs["do_classifier_free_guidance"] is True
+    assert pipe.kwargs["clean_caption"] is True
+    assert list(result) == [
+        "prompt_embeds",
+        "prompt_attention_mask",
+        "negative_prompt_embeds",
+        "negative_prompt_attention_mask",
+    ]
+
+
+def test_completed_run_preflight_requires_matching_calibration_and_files(tmp_path):
+    cfg = Q7Config(
+        output_dir=str(tmp_path),
+        prompts=("p",),
+        conditions=("baseline", "remove_vstar"),
+        grid_cells=(("early", "writer"),),
+    )
+    vstar_path = tmp_path / "vstar.npy"
+    np.save(vstar_path, np.ones(4, np.float32))
+    digest = hashlib.sha256(vstar_path.read_bytes()).hexdigest()
+    (tmp_path / "vstar.json").write_text(
+        json.dumps(
+            {
+                "config_hash": config_hash(cfg),
+                "experiment_revision": EXPERIMENT_REVISION,
+                "sha256": digest,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert calibration_is_compatible(cfg)
+    clean, edited = tmp_path / "clean.png", tmp_path / "edited.png"
+    clean.touch()
+    edited.touch()
+    row = {
+        "prompt_id": 0,
+        "prompt": "p",
+        "seed": 0,
+        "condition": "remove_vstar",
+        "phase": "early",
+        "zone": "writer",
+        "clean_path": str(clean),
+        "image_path": str(edited),
+        "config_hash": config_hash(cfg),
+        "generation_params": {
+            "experiment_revision": EXPERIMENT_REVISION,
+            "calibration_sha256": digest,
+        },
+    }
+    (tmp_path / "runs.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    assert run_is_complete(cfg)
+    edited.unlink()
+    assert not run_is_complete(cfg)
 
 
 def test_q7_rejects_non_flux1_block_layout():

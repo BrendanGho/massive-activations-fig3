@@ -281,6 +281,23 @@ real-CFG batch is `[unconditional, conditional]`; residual and sink edits affect
 conditional row, preserving the unconditional branch exactly. FLUX.2 remains unsupported because
 its register zones and causal channel have not been calibrated for this design.
 
+The Colab defaults to `Q7_RUN_MODE="screen"`. Its cross-shaped design tests all three denoising
+phases at mid-register depth and all four depth zones during the middle phase (six unique cells),
+using one prompt/seed: 32 generations and 31 temporary PNGs rather than the full grid's 558
+generations and 549 PNGs. `smoke` runs seven generations solely as an API check; `full` retains
+the complete 3-prompt × 3-seed × 3-phase × 4-zone design. Screen mode estimates temporal and
+depth main effects but cannot rule out phase-by-depth interactions, so confirm important cells
+or use `full` for the final factorial result.
+
+Q7's full PNG grid is written to `/content/q7_work`, not Google Drive. Raw residual and attention
+traces remain in memory and are never serialized. After evaluation, the notebook optionally
+copies only CSV/JSON audit files, the small `vstar` direction, and rendered figures to
+`<DRIVE_ROOT>/<model>/q7_compact/<mode>`; the `images/` directory is explicitly excluded. Local
+images disappear when the Colab runtime resets, so finish evaluation in the same session. Prompt
+conditioning is encoded once per unique prompt, calibration and intervention generation share one
+loaded pipeline, clean evaluation features are cached, and a completed scenario is skipped on
+resume when its local files still exist.
+
 `vstar` calibration follows the paper's scope: unit-normalized high-norm tokens are pooled
 across configured prompts, seeds, denoising steps, and only the preset's register-zone
 layers (FLUX 18-39; PixArt 13-20), not unrelated outliers from the full network. A versioned run identity prevents
@@ -316,9 +333,11 @@ model or GPU after changing plotting code:
 python -m src.experiments.generation_function --config configs/q7_colab.json --plot
 ```
 
-## Colab storage
+## Stage 1 cache storage
 
-Point both dirs at a Drive mount so writes survive a session ending mid-run (no code change):
+The older Stage 1 pipeline can persist its potentially large activation shards by pointing both
+directories at a Drive mount. This is separate from Q7; with limited Drive capacity, leave these
+paths under `/content` as well. Q7 deliberately exports no raw activation cache or full image grid.
 
 ```python
 from google.colab import drive; drive.mount('/content/drive')

@@ -27,7 +27,7 @@ CONDITIONS = (
     "remove_top_registers",
     "norm_only",
 )
-EXPERIMENT_REVISION = "q7-generation-function-v3"
+EXPERIMENT_REVISION = "q7-generation-function-v4"
 GENEVAL_METRICS = (
     "geneval_counting",
     "geneval_attribute",
@@ -65,6 +65,7 @@ class Q7Config:
             "dissolution": (35, 39),
         }
     )
+    grid_cells: tuple[tuple[str, str], ...] | None = None
     conditions: tuple[str, ...] = CONDITIONS
     vstar_path: str | None = None
 
@@ -77,6 +78,8 @@ class Q7Config:
         for key in ("phases", "zones"):
             if key in raw:
                 raw[key] = {k: tuple(v) for k, v in raw[key].items()}
+        if raw.get("grid_cells") is not None:
+            raw["grid_cells"] = tuple(tuple(cell) for cell in raw["grid_cells"])
         cfg = cls(**raw)
         cfg.validate()
         return cfg
@@ -97,6 +100,16 @@ class Q7Config:
             for name, (lo, hi) in ranges.items():
                 if lo < 0 or hi < lo or hi > upper:
                     raise ValueError(f"invalid {group}.{name} range {(lo, hi)}")
+        if self.grid_cells is not None:
+            if not self.grid_cells:
+                raise ValueError("grid_cells cannot be empty")
+            bad_cells = [
+                cell
+                for cell in self.grid_cells
+                if len(cell) != 2 or cell[0] not in self.phases or cell[1] not in self.zones
+            ]
+            if bad_cells:
+                raise ValueError(f"grid_cells reference unknown phase/zone names: {bad_cells}")
 
 
 def in_target(step: int, layer: int, phase: tuple[int, int], zone: tuple[int, int]) -> bool:
@@ -110,6 +123,15 @@ def denoising_thirds(num_steps: int) -> dict[str, tuple[int, int]]:
     edges = [round(i * num_steps / 3) for i in range(4)]
     names = ("early", "middle", "late")
     return {name: (edges[i], edges[i + 1] - 1) for i, name in enumerate(names)}
+
+
+def selected_grid_cells(cfg: Q7Config, smoke: bool = False) -> list[tuple[str, str]]:
+    """Return explicit screening cells or the full phase-by-zone factorial."""
+    if smoke:
+        return [(next(iter(cfg.phases)), next(iter(cfg.zones)))]
+    if cfg.grid_cells is not None:
+        return list(dict.fromkeys(cfg.grid_cells))
+    return [(phase, zone) for phase in cfg.phases for zone in cfg.zones]
 
 
 def validate_model_layout(blocks: list[Any], cfg: Q7Config) -> None:
@@ -1137,26 +1159,88 @@ class SinkAttentionHooks:
         return audit_counts(self.counts, self.fires, self.n_steps, self.phase, self.zone)
 
 
-def _generate(pipe, cfg: Q7Config, prompt: str, seed: int):
+def _conditioning_for_prompt(pipe, cfg: Q7Config, prompt: str, cache: dict[str, dict]):
+    """Encode each unique prompt once and reuse the immutable conditioning tensors."""
+    import torch
+
+    if prompt in cache:
+        return cache[prompt]
+    device = getattr(pipe, "_execution_device", cfg.device)
+    with torch.inference_mode():
+        if cfg.model_family == "flux1":
+            prompt_embeds, pooled_prompt_embeds, _text_ids = pipe.encode_prompt(
+                prompt=prompt,
+                device=device,
+                num_images_per_prompt=1,
+                max_sequence_length=512,
+            )
+            conditioning = {
+                "prompt_embeds": prompt_embeds,
+                "pooled_prompt_embeds": pooled_prompt_embeds,
+            }
+        else:
+            do_cfg = cfg.guidance_scale is not None and cfg.guidance_scale > 1.0
+            (
+                prompt_embeds,
+                prompt_attention_mask,
+                negative_prompt_embeds,
+                negative_prompt_attention_mask,
+            ) = pipe.encode_prompt(
+                prompt=prompt,
+                do_classifier_free_guidance=do_cfg,
+                negative_prompt="",
+                num_images_per_prompt=1,
+                device=device,
+                clean_caption=True,
+                max_sequence_length=300,
+            )
+            conditioning = {
+                "prompt_embeds": prompt_embeds,
+                "prompt_attention_mask": prompt_attention_mask,
+                "negative_prompt_embeds": negative_prompt_embeds,
+                "negative_prompt_attention_mask": negative_prompt_attention_mask,
+            }
+    cache[prompt] = conditioning
+    return conditioning
+
+
+def _generate(
+    pipe,
+    cfg: Q7Config,
+    prompt: str,
+    seed: int,
+    conditioning: dict[str, Any] | None = None,
+):
     import torch
 
     gen_device = "cpu" if cfg.device == "cuda" else cfg.device
     generator = torch.Generator(gen_device).manual_seed(seed)
-    kwargs = {
-        "prompt": prompt,
+    kwargs: dict[str, Any] = {
         "height": cfg.resolution,
         "width": cfg.resolution,
         "num_inference_steps": cfg.num_steps,
         "generator": generator,
         "output_type": "pil",
     }
+    if conditioning is None:
+        kwargs["prompt"] = prompt
+    else:
+        kwargs.update(conditioning)
     if cfg.guidance_scale is not None:
         kwargs["guidance_scale"] = cfg.guidance_scale
     with torch.inference_mode():
         return pipe(**kwargs).images[0]
 
 
-def _trace_clean(pipe, blocks, cfg, prompt, seed, capture_sinks: bool = True):
+def _trace_clean(
+    pipe,
+    blocks,
+    cfg,
+    prompt,
+    seed,
+    capture_sinks: bool = True,
+    conditioning: dict[str, Any] | None = None,
+):
     register_layers = {
         layer for lo, hi in cfg.zones.values() for layer in range(int(lo), int(hi) + 1)
     }
@@ -1204,7 +1288,7 @@ def _trace_clean(pipe, blocks, cfg, prompt, seed, capture_sinks: bool = True):
 
         handles.append(ref.module.register_forward_hook(hook))
     try:
-        image = _generate(pipe, cfg, prompt, seed)
+        image = _generate(pipe, cfg, prompt, seed, conditioning)
     finally:
         for h in handles:
             h.remove()
@@ -1224,8 +1308,7 @@ def _save_image(image, path: Path):
     image.save(path)
 
 
-def calibrate_vstar(cfg: Q7Config, smoke: bool = False) -> Path:
-    """Pool clean register-zone vectors across prompts, seeds, steps, and layers."""
+def _load_q7_model(cfg: Q7Config):
     from src.common.model_utils import discover_blocks, load_pipeline
 
     pipe_cfg = type(
@@ -1236,16 +1319,112 @@ def calibrate_vstar(cfg: Q7Config, smoke: bool = False) -> Path:
     pipe = load_pipeline(pipe_cfg, offload=cfg.offload)
     blocks = discover_blocks(pipe.transformer)
     validate_model_layout(blocks, cfg)
+    return pipe, blocks
+
+
+def _calibration_path(cfg: Q7Config) -> Path:
+    return Path(cfg.vstar_path) if cfg.vstar_path else Path(cfg.output_dir) / "vstar.npy"
+
+
+def _recorded_file_exists(row: dict[str, Any], key: str) -> bool:
+    value = row.get(key)
+    return isinstance(value, str) and bool(value) and Path(value).is_file()
+
+
+def calibration_is_compatible(cfg: Q7Config) -> bool:
+    """Only reuse vstar when both its metadata and bytes match this exact experiment."""
+    path = _calibration_path(cfg)
+    metadata_path = path.with_suffix(".json")
+    if not path.exists() or not metadata_path.exists():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        return (
+            metadata.get("config_hash") == config_hash(cfg)
+            and metadata.get("experiment_revision") == EXPERIMENT_REVISION
+            and metadata.get("sha256") == file_sha256(path)
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def run_is_complete(cfg: Q7Config, smoke: bool = False) -> bool:
+    """Cheap preflight used to avoid loading a model for an already-complete local run."""
+    if not calibration_is_compatible(cfg):
+        return False
+    manifest = Path(cfg.output_dir) / "runs.jsonl"
+    if not manifest.exists():
+        return False
+    calibration_sha = file_sha256(_calibration_path(cfg))
+    completed = set()
+    try:
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            params = row.get("generation_params", {})
+            if (
+                row.get("config_hash") != config_hash(cfg)
+                or params.get("experiment_revision") != EXPERIMENT_REVISION
+                or params.get("calibration_sha256") != calibration_sha
+                or not _recorded_file_exists(row, "image_path")
+                or not _recorded_file_exists(row, "clean_path")
+            ):
+                continue
+            completed.add(
+                (
+                    row["prompt_id"],
+                    row["prompt"],
+                    row["seed"],
+                    row["condition"],
+                    row["phase"],
+                    row["zone"],
+                )
+            )
+    except (OSError, ValueError, KeyError):
+        return False
+    jobs = [(prompt, seed) for prompt in cfg.prompts for seed in cfg.seeds]
+    if smoke:
+        jobs = jobs[:1]
+    expected = {
+        (prompt_id, prompt, seed, condition, phase, zone)
+        for prompt_id, (prompt, seed) in enumerate(jobs)
+        for phase, zone in selected_grid_cells(cfg, smoke)
+        for condition in cfg.conditions
+        if condition != "baseline"
+    }
+    return bool(expected) and expected.issubset(completed)
+
+
+def calibrate_vstar(
+    cfg: Q7Config,
+    smoke: bool = False,
+    *,
+    pipe=None,
+    blocks=None,
+    conditioning_cache: dict[str, dict] | None = None,
+) -> Path:
+    """Pool clean register-zone vectors across prompts, seeds, steps, and layers."""
+    if pipe is None or blocks is None:
+        pipe, blocks = _load_q7_model(cfg)
+    conditioning_cache = conditioning_cache if conditioning_cache is not None else {}
     jobs = [(p, s) for p in cfg.prompts for s in cfg.seeds]
     if smoke:
         jobs = jobs[:1]
     vectors = []
     for prompt, seed in jobs:
-        _image, trace = _trace_clean(pipe, blocks, cfg, prompt, seed, capture_sinks=False)
+        conditioning = _conditioning_for_prompt(pipe, cfg, prompt, conditioning_cache)
+        _image, trace = _trace_clean(
+            pipe,
+            blocks,
+            cfg,
+            prompt,
+            seed,
+            capture_sinks=False,
+            conditioning=conditioning,
+        )
         vectors.extend(trace.vectors)
     if not vectors:
         raise RuntimeError("no natural register vectors found during vstar calibration")
-    path = Path(cfg.vstar_path) if cfg.vstar_path else Path(cfg.output_dir) / "vstar.npy"
+    path = _calibration_path(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, fit_vstar(np.asarray(vectors)))
     metadata = {
@@ -1260,27 +1439,30 @@ def calibrate_vstar(cfg: Q7Config, smoke: bool = False) -> Path:
         ),
         "config_hash": config_hash(cfg),
         "experiment_revision": EXPERIMENT_REVISION,
+        "sha256": file_sha256(path),
     }
     path.with_suffix(".json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return path
 
 
-def run(cfg: Q7Config, smoke: bool = False) -> None:
+def run(
+    cfg: Q7Config,
+    smoke: bool = False,
+    *,
+    pipe=None,
+    blocks=None,
+    conditioning_cache: dict[str, dict] | None = None,
+) -> None:
     """Run the paired grid. `suppress_sink` requires the optional attention-mask adapter below."""
-    from src.common.model_utils import discover_blocks, load_pipeline
-
-    pipe_cfg = type(
-        "Cfg", (), {"model_ckpt": cfg.model_ckpt, "dtype": cfg.dtype, "device": cfg.device}
-    )()
-    pipe = load_pipeline(pipe_cfg, offload=cfg.offload)
-    blocks = discover_blocks(pipe.transformer)
-    validate_model_layout(blocks, cfg)
+    if pipe is None or blocks is None:
+        pipe, blocks = _load_q7_model(cfg)
+    conditioning_cache = conditioning_cache if conditioning_cache is not None else {}
     out = Path(cfg.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    calibrated = Path(cfg.vstar_path) if cfg.vstar_path else out / "vstar.npy"
-    if not calibrated.exists():
-        raise FileNotFoundError(
-            f"calibrated vstar not found at {calibrated}; run --calibrate-vstar first"
+    calibrated = _calibration_path(cfg)
+    if not calibration_is_compatible(cfg):
+        raise RuntimeError(
+            f"compatible calibrated vstar not found at {calibrated}; run --calibrate-vstar first"
         )
     scheduler_config = json.loads(json.dumps(dict(pipe.scheduler.config), default=str))
     calibration_sha = file_sha256(calibrated)
@@ -1306,7 +1488,11 @@ def run(cfg: Q7Config, smoke: bool = False) -> None:
     if manifest.exists():
         for line in manifest.read_text(encoding="utf-8").splitlines():
             old = json.loads(line)
-            if old.get("run_identity") != identity or not Path(old.get("image_path", "")).exists():
+            if (
+                old.get("run_identity") != identity
+                or not _recorded_file_exists(old, "image_path")
+                or not _recorded_file_exists(old, "clean_path")
+            ):
                 continue
             completed.add(
                 (
@@ -1322,74 +1508,80 @@ def run(cfg: Q7Config, smoke: bool = False) -> None:
     jobs = [(p, s) for p in cfg.prompts for s in cfg.seeds]
     if smoke:
         jobs = jobs[:1]
+    cells = selected_grid_cells(cfg, smoke)
+    conditions = [condition for condition in cfg.conditions if condition != "baseline"]
     for prompt_id, (prompt, seed) in enumerate(jobs):
-        clean, trace = _trace_clean(pipe, blocks, cfg, prompt, seed)
         clean_path = out / "images" / f"{identity}_p{prompt_id:03d}_s{seed}_baseline.png"
+        expected = {
+            (identity, prompt_id, prompt, seed, condition, phase_name, zone_name)
+            for phase_name, zone_name in cells
+            for condition in conditions
+        }
+        if expected and expected.issubset(completed) and clean_path.is_file():
+            print(f"resume: scenario p{prompt_id:03d}/s{seed} already complete")
+            continue
+        conditioning = _conditioning_for_prompt(pipe, cfg, prompt, conditioning_cache)
+        clean, trace = _trace_clean(pipe, blocks, cfg, prompt, seed, conditioning=conditioning)
         _save_image(clean, clean_path)
         vstar = np.load(calibrated)
-        phase_items = list(cfg.phases.items())[:1] if smoke else list(cfg.phases.items())
-        zone_items = list(cfg.zones.items())[:1] if smoke else list(cfg.zones.items())
-        for phase_name, phase in phase_items:
-            for zone_name, zone in zone_items:
-                conditions = [c for c in cfg.conditions if c != "baseline"]
-                for condition in conditions:
-                    job_key = (
-                        identity,
-                        prompt_id,
-                        prompt,
-                        seed,
+        for phase_name, zone_name in cells:
+            phase, zone = cfg.phases[phase_name], cfg.zones[zone_name]
+            for condition in conditions:
+                job_key = (
+                    identity,
+                    prompt_id,
+                    prompt,
+                    seed,
+                    condition,
+                    phase_name,
+                    zone_name,
+                )
+                if job_key in completed:
+                    continue
+                if condition == "suppress_sink":
+                    hooks = SinkAttentionHooks(
+                        blocks, trace, phase, zone, cfg.num_steps, cfg.model_family
+                    ).attach()
+                else:
+                    hooks = ResidualInterventionHooks(
+                        blocks,
+                        trace,
                         condition,
-                        phase_name,
-                        zone_name,
+                        phase,
+                        zone,
+                        vstar,
+                        cfg.channel,
+                        cfg.num_steps,
+                    ).attach(pipe.transformer)
+                try:
+                    image = _generate(pipe, cfg, prompt, seed, conditioning)
+                finally:
+                    hooks.detach()
+                audit = hooks.audit()
+                if not audit["ok"]:
+                    raise RuntimeError(
+                        f"intervention audit failed for {condition}/{phase_name}/{zone_name}: "
+                        + "; ".join(audit["errors"])
                     )
-                    if job_key in completed:
-                        continue
-                    if condition == "suppress_sink":
-                        hooks = SinkAttentionHooks(
-                            blocks, trace, phase, zone, cfg.num_steps, cfg.model_family
-                        ).attach()
-                    else:
-                        hooks = ResidualInterventionHooks(
-                            blocks,
-                            trace,
-                            condition,
-                            phase,
-                            zone,
-                            vstar,
-                            cfg.channel,
-                            cfg.num_steps,
-                        ).attach(pipe.transformer)
-                    try:
-                        image = _generate(pipe, cfg, prompt, seed)
-                    finally:
-                        hooks.detach()
-                    audit = hooks.audit()
-                    if not audit["ok"]:
-                        raise RuntimeError(
-                            f"intervention audit failed for {condition}/{phase_name}/{zone_name}: "
-                            + "; ".join(audit["errors"])
-                        )
-                    stem = (
-                        f"{identity}_p{prompt_id:03d}_s{seed}_{condition}_{phase_name}_{zone_name}"
-                    )
-                    image_path = out / "images" / f"{stem}.png"
-                    _save_image(image, image_path)
-                    row = {
-                        "prompt_id": prompt_id,
-                        "prompt": prompt,
-                        "seed": seed,
-                        "condition": condition,
-                        "phase": phase_name,
-                        "zone": zone_name,
-                        "clean_path": str(clean_path),
-                        "image_path": str(image_path),
-                        "config_hash": config_hash(cfg),
-                        "run_identity": identity,
-                        "generation_params": generation_params,
-                        "intervention_audit": audit,
-                    }
-                    with manifest.open("a", encoding="utf-8") as fh:
-                        fh.write(json.dumps(row, sort_keys=True) + "\n")
+                stem = f"{identity}_p{prompt_id:03d}_s{seed}_{condition}_{phase_name}_{zone_name}"
+                image_path = out / "images" / f"{stem}.png"
+                _save_image(image, image_path)
+                row = {
+                    "prompt_id": prompt_id,
+                    "prompt": prompt,
+                    "seed": seed,
+                    "condition": condition,
+                    "phase": phase_name,
+                    "zone": zone_name,
+                    "clean_path": str(clean_path),
+                    "image_path": str(image_path),
+                    "config_hash": config_hash(cfg),
+                    "run_identity": identity,
+                    "generation_params": generation_params,
+                    "intervention_audit": audit,
+                }
+                with manifest.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row, sort_keys=True) + "\n")
 
 
 def evaluate(cfg: Q7Config, structured_scores_path: str | None = None) -> None:
@@ -1449,12 +1641,25 @@ def evaluate(cfg: Q7Config, structured_scores_path: str | None = None) -> None:
         reward_model = RM.load("ImageReward-v1.0")
     except ImportError:
         pass
+    clean_image_cache: dict[str, tuple[Any, np.ndarray]] = {}
+    clean_lpips_cache: dict[str, Any] = {}
+    clean_clip_cache: dict[str, Any] = {}
+    text_clip_cache: dict[str, Any] = {}
+    clean_reward_cache: dict[tuple[str, str], float] = {}
+
+    def load_rgb(path: str):
+        with Image.open(path) as source:
+            pil = source.convert("RGB").copy()
+        return pil, np.asarray(pil)
+
     for row in manifest_rows:
         if row.get("run_identity") != identity:
             continue
-        clean_pil = Image.open(row["clean_path"]).convert("RGB")
-        edited_pil = Image.open(row["image_path"]).convert("RGB")
-        clean, edited = np.asarray(clean_pil), np.asarray(edited_pil)
+        clean_key = row["clean_path"]
+        if clean_key not in clean_image_cache:
+            clean_image_cache[clean_key] = load_rgb(clean_key)
+        clean_pil, clean = clean_image_cache[clean_key]
+        edited_pil, edited = load_rgb(row["image_path"])
         row.update(frequency_distances(clean, edited))
         row.update(
             lpips=None,
@@ -1484,20 +1689,36 @@ def evaluate(cfg: Q7Config, structured_scores_path: str | None = None) -> None:
             def lp_tensor(a):
                 return torch.from_numpy(a.copy()).permute(2, 0, 1)[None].float() / 127.5 - 1
 
+            if clean_key not in clean_lpips_cache:
+                clean_lpips_cache[clean_key] = lp_tensor(clean)
             with torch.inference_mode():
-                row["lpips"] = float(lpips_model(lp_tensor(clean), lp_tensor(edited)).item())
+                row["lpips"] = float(
+                    lpips_model(clean_lpips_cache[clean_key], lp_tensor(edited)).item()
+                )
         if clip_model is not None:
             import torch
 
             with torch.inference_mode():
-                ims = torch.stack([clip_preprocess(clean_pil), clip_preprocess(edited_pil)])
-                imf = clip_model.encode_image(ims)
-                imf = imf / imf.norm(dim=-1, keepdim=True)
-                txt = clip_model.encode_text(clip_tokenizer([row["prompt"]]))
-                txt = txt / txt.norm(dim=-1, keepdim=True)
-                row["clip_clean"], row["clip_edited"] = [float(v) for v in (imf @ txt.T)[:, 0]]
+                if clean_key not in clean_clip_cache:
+                    clean_feature = clip_model.encode_image(clip_preprocess(clean_pil)[None])
+                    clean_clip_cache[clean_key] = clean_feature / clean_feature.norm(
+                        dim=-1, keepdim=True
+                    )
+                edited_feature = clip_model.encode_image(clip_preprocess(edited_pil)[None])
+                edited_feature = edited_feature / edited_feature.norm(dim=-1, keepdim=True)
+                if row["prompt"] not in text_clip_cache:
+                    text_feature = clip_model.encode_text(clip_tokenizer([row["prompt"]]))
+                    text_clip_cache[row["prompt"]] = text_feature / text_feature.norm(
+                        dim=-1, keepdim=True
+                    )
+                text_feature = text_clip_cache[row["prompt"]]
+                row["clip_clean"] = float((clean_clip_cache[clean_key] @ text_feature.T)[0, 0])
+                row["clip_edited"] = float((edited_feature @ text_feature.T)[0, 0])
         if reward_model is not None:
-            row["image_reward_clean"] = float(reward_model.score(row["prompt"], row["clean_path"]))
+            reward_key = (row["prompt"], clean_key)
+            if reward_key not in clean_reward_cache:
+                clean_reward_cache[reward_key] = float(reward_model.score(row["prompt"], clean_key))
+            row["image_reward_clean"] = clean_reward_cache[reward_key]
             row["image_reward_edited"] = float(reward_model.score(row["prompt"], row["image_path"]))
         add_paired_prompt_deltas(row)
         rows.append(row)
@@ -1548,16 +1769,49 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", required=True)
     p.add_argument("--smoke", action="store_true")
-    p.add_argument("--evaluate", action="store_true")
+    action = p.add_mutually_exclusive_group()
+    action.add_argument("--evaluate", action="store_true")
     p.add_argument(
         "--structured-scores",
         help="optional GenEval-style clean/edited CSV to merge during --evaluate",
     )
-    p.add_argument("--plot", action="store_true", help="regenerate figures from paired_metrics.csv")
-    p.add_argument("--calibrate-vstar", action="store_true")
+    action.add_argument(
+        "--plot", action="store_true", help="regenerate figures from paired_metrics.csv"
+    )
+    action.add_argument("--calibrate-vstar", action="store_true")
+    action.add_argument(
+        "--calibrate-and-run",
+        action="store_true",
+        help="load the model once, cache prompt conditioning, calibrate vstar, then run",
+    )
     args = p.parse_args(argv)
     cfg = Q7Config.from_json(args.config)
-    if args.calibrate_vstar:
+    if args.calibrate_and_run:
+        if run_is_complete(cfg, smoke=args.smoke):
+            print("resume: exact local run already complete; skipping model load")
+            return
+        pipe, blocks = _load_q7_model(cfg)
+        conditioning_cache: dict[str, dict] = {}
+        if calibration_is_compatible(cfg):
+            print(f"resume: reusing compatible calibration {_calibration_path(cfg)}")
+        else:
+            print(
+                calibrate_vstar(
+                    cfg,
+                    smoke=args.smoke,
+                    pipe=pipe,
+                    blocks=blocks,
+                    conditioning_cache=conditioning_cache,
+                )
+            )
+        run(
+            cfg,
+            smoke=args.smoke,
+            pipe=pipe,
+            blocks=blocks,
+            conditioning_cache=conditioning_cache,
+        )
+    elif args.calibrate_vstar:
         print(calibrate_vstar(cfg, smoke=args.smoke))
     elif args.evaluate:
         evaluate(cfg, structured_scores_path=args.structured_scores)
