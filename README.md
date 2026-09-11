@@ -267,20 +267,26 @@ python -m src.experiments text --config configs/highnorm_tokens.yaml --layers al
 
 ## Q7 generation-level function
 
-Part 5 of the Colab provides a `Q7_ACTIVE_MODEL` dropdown for `flux-schnell` and
-`flux1-dev`. All model-specific Q7 values come from the notebook's shared `MODEL_PRESETS`:
+Part 5 of the Colab provides a `Q7_ACTIVE_MODEL` dropdown for `flux-schnell`,
+`flux1-dev`, and `pixart-sigma`. All model-specific Q7 values come from the notebook's shared `MODEL_PRESETS`:
 checkpoint, resolution, schedule, guidance, memory threshold, dominant channel, and depth
 zones. Schnell uses four steps without CFG; Dev uses 28 steps with guidance 3.5. The
-denoising thirds are derived from the selected preset's step count automatically.
-The Q7 hooks and writer/register/dissolution zones are FLUX.1-specific; PixArt-Sigma and
-FLUX.2 are therefore intentionally not offered by this selector.
+denoising thirds are derived from the selected preset's step count automatically. PixArt uses
+20 steps, guidance 4.5, channel 293, and its shorter block-13-to-20 register interval.
+
+The implementation dispatches to architecture-specific adapters. FLUX suppresses natural sinks
+in joint attention while retaining text-query outputs. PixArt suppresses sinks in the image-only
+`attn1` self-attention and leaves its separate T5 cross-attention (`attn2`) unchanged. PixArt's
+real-CFG batch is `[unconditional, conditional]`; residual and sink edits affect only the last,
+conditional row, preserving the unconditional branch exactly. FLUX.2 remains unsupported because
+its register zones and causal channel have not been calibrated for this design.
 
 `vstar` calibration follows the paper's scope: unit-normalized high-norm tokens are pooled
 across configured prompts, seeds, denoising steps, and only the preset's register-zone
-layers (18-39), not unrelated outliers from all 57 layers. A versioned run identity prevents
+layers (FLUX 18-39; PixArt 13-20), not unrelated outliers from the full network. A versioned run identity prevents
 results produced by an older intervention implementation from being resumed as current runs.
-The depth conditions are sustained zone interventions (1 writer layer, then 4, 12, and 5
-layers), not dose-matched single-layer ablations; interpret the causal map as regime-level
+The depth conditions are sustained zone interventions (FLUX: 1/4/12/5 layers; PixArt:
+1/2/3/2), not dose-matched single-layer ablations; interpret the causal map as regime-level
 suppression and use the recorded per-layer fire counts when comparing effect magnitude.
 
 For GenEval-style counting, attribute, and spatial-relation evaluation, set the Colab's

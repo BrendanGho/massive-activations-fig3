@@ -2,8 +2,8 @@
 
 ## Question
 
-What selective image-generation function is causally supported by the FLUX register state,
-its dominant channel (154), and the associated attention sink?
+What selective image-generation function is causally supported by the FLUX/PixArt register
+state, its dominant channel (FLUX 154; PixArt 293), and the associated attention sink?
 
 ## Design
 
@@ -15,10 +15,12 @@ Conditions:
 
 - `remove_vstar`: subtract the projection onto a calibrated unit direction only at natural
   register tokens.
-- `suppress_channel_154`: zero channel 154 for every image token.
+- `suppress_channel`: zero the model preset's dominant channel for every image token (FLUX 154;
+  PixArt 293).
 - `suppress_sink`: trace the strongest natural image key separately for every attention head
   using image-key-renormalized incoming attention, then block image queries from attending to
-  that head's sink while leaving text-query routing and the residual token unchanged.
+  that head's sink while leaving text-query routing and the residual token unchanged. For PixArt,
+  this targets image self-attention (`attn1`) and leaves T5 cross-attention (`attn2`) untouched.
 - `remove_top_registers`: zero the complete residual vectors of the highest-norm natural
   register tokens.
 - `norm_only`: scale natural register vectors to the ordinary-token median norm while preserving
@@ -27,6 +29,10 @@ Conditions:
 Cross each condition with early/middle/late denoising thirds and writer/early-register/
 mid-register/dissolution depth zones. Prompt, seed, initial generator state, scheduler, guidance,
 resolution, and step count are identical within every pair.
+
+FLUX.1 uses its 57-block joint-attention layout and register zones 18-39. PixArt-Sigma uses its
+28 image-only DiT blocks, block 13 as the writer, and the shorter 13-20 register interval. Because
+PixArt uses real CFG, interventions edit only the conditional (last) row of `[uncond, cond]`.
 
 ## Outputs
 
@@ -52,6 +58,8 @@ resolution, and step count are identical within every pair.
 - Sink suppression edits attention routing only; it does not overwrite the residual-stream token.
   Edited image-query rows use the pinned Diffusers attention dispatcher, model dtype, and active
   backend with only the per-head natural-sink key masked; clean text-query outputs are retained.
+  PixArt uses the native scaled-dot-product path of its pinned `AttnProcessor2_0`, changes only
+  conditional image self-attention, and retains the unconditional CFG row and cross-attention.
 - A smoke mode runs one baseline plus every condition in one phase/zone and asserts both total
   forward counts and actual targeted edit counts before a full run.
 - Every generated pair records all generation parameters and hashes the experiment config.

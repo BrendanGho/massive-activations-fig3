@@ -6,10 +6,13 @@ import pytest
 
 from src.experiments.generation_function import (
     NaturalTrace,
+    PixArtSinkSuppressProcessor,
     Q7Config,
     SinkSuppressProcessor,
     _dispatch_suppressed_image_attention,
+    _infer_image_token_count,
     _suppressed_image_attention,
+    _torch_edit,
     add_paired_prompt_deltas,
     apply_numpy_intervention,
     audit_counts,
@@ -23,6 +26,7 @@ from src.experiments.generation_function import (
     paired_bootstrap,
     run_identity,
     validate_flux1_layout,
+    validate_model_layout,
 )
 
 
@@ -32,12 +36,17 @@ def test_targeting_is_inclusive():
     assert not in_target(5, 12, (2, 4), (10, 12))
 
 
-def test_denoising_thirds_are_exhaustive_for_both_flux1_presets():
+def test_denoising_thirds_are_exhaustive_for_q7_presets():
     assert denoising_thirds(4) == {"early": (0, 0), "middle": (1, 2), "late": (3, 3)}
     assert denoising_thirds(28) == {
         "early": (0, 8),
         "middle": (9, 18),
         "late": (19, 27),
+    }
+    assert denoising_thirds(20) == {
+        "early": (0, 6),
+        "middle": (7, 12),
+        "late": (13, 19),
     }
 
 
@@ -45,6 +54,39 @@ def test_q7_rejects_non_flux1_block_layout():
     blocks = [SimpleNamespace(layer_id=i, kind="block", module=None) for i in range(28)]
     with pytest.raises(RuntimeError, match="57 blocks"):
         validate_flux1_layout(blocks, Q7Config(prompts=("p",)))
+
+
+def test_q7_accepts_pixart_layout_and_checks_attn1_width():
+    attention = SimpleNamespace(to_q=SimpleNamespace(in_features=1152))
+    blocks = [
+        SimpleNamespace(layer_id=i, kind="double", module=SimpleNamespace(attn1=attention))
+        for i in range(28)
+    ]
+    cfg = Q7Config(
+        prompts=("p",),
+        model_family="pixart_sigma",
+        channel=293,
+        num_steps=20,
+        phases=denoising_thirds(20),
+        zones={"writer": (13, 13), "register": (14, 20)},
+    )
+    cfg.validate()
+    validate_model_layout(blocks, cfg)
+
+
+def test_pixart_image_token_count_uses_latent_patch_grid():
+    torch = pytest.importorskip("torch")
+    transformer = SimpleNamespace(config=SimpleNamespace(patch_size=2))
+    assert _infer_image_token_count(transformer, torch.zeros(2, 4, 128, 128)) == 4096
+
+
+def test_torch_intervention_preserves_unconditional_cfg_row():
+    torch = pytest.importorskip("torch")
+    x = torch.ones(2, 3, 4)
+    edited = _torch_edit(x, "suppress_channel", np.zeros(3, bool), None, 2)
+    assert torch.equal(edited[0], x[0])
+    assert torch.all(edited[1, :, 2] == 0)
+    assert torch.equal(edited[1, :, [0, 1, 3]], x[1, :, [0, 1, 3]])
 
 
 def test_register_mask_threshold_and_cap():
@@ -66,7 +108,7 @@ def test_fit_vstar_and_remove_projection():
 def test_channel_and_full_register_removal_are_selective():
     x = np.arange(20, dtype=np.float32).reshape(5, 4)
     mask = np.array([0, 1, 0, 0, 0], bool)
-    ch = apply_numpy_intervention(x, "suppress_channel_154", mask, channel=2)
+    ch = apply_numpy_intervention(x, "suppress_channel", mask, channel=2)
     assert np.all(ch[:, 2] == 0) and np.array_equal(ch[:, [0, 1, 3]], x[:, [0, 1, 3]])
     reg = apply_numpy_intervention(x, "remove_top_registers", mask)
     assert np.all(reg[1] == 0) and np.array_equal(reg[~mask], x[~mask])
@@ -94,7 +136,7 @@ def test_generate_figures_from_smoke_metrics(tmp_path):
     image_module = pytest.importorskip("PIL.Image")
     conditions = [
         "remove_vstar",
-        "suppress_channel_154",
+        "suppress_channel",
         "suppress_sink",
         "remove_top_registers",
         "norm_only",
@@ -311,3 +353,49 @@ def test_sink_processor_preserves_double_stream_text_output_identity():
     assert output[1] is text_sentinel
     assert attention.dropout_calls == 1
     assert counts[1] == 1 and fires[1] == 1
+
+
+def test_pixart_sink_processor_preserves_unconditional_cfg_row():
+    torch = pytest.importorskip("torch")
+    attention_processor = pytest.importorskip("diffusers.models.attention_processor")
+
+    class FakePixArtAttention:
+        heads = 2
+        spatial_norm = None
+        group_norm = None
+        norm_q = None
+        norm_k = None
+        residual_connection = False
+        rescale_output_factor = 1.0
+
+        def __init__(self):
+            self.to_q = torch.nn.Linear(4, 4, bias=False)
+            self.to_k = torch.nn.Linear(4, 4, bias=False)
+            self.to_v = torch.nn.Linear(4, 4, bias=False)
+            self.to_out = torch.nn.ModuleList(
+                [torch.nn.Linear(4, 4, bias=False), torch.nn.Dropout(0.0)]
+            )
+            with torch.no_grad():
+                for layer in (self.to_q, self.to_k, self.to_v, self.to_out[0]):
+                    layer.weight.copy_(torch.eye(4))
+
+    original = attention_processor.AttnProcessor2_0()
+    attention = FakePixArtAttention()
+    hidden = torch.tensor(
+        [
+            [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0]],
+            [[2.0, 0, 0, 0], [0, 2.0, 0, 0], [0, 0, 2.0, 0]],
+        ]
+    )
+    clean = original(attention, hidden)
+    trace = NaturalTrace(3.0, 8)
+    trace.n_image = 3
+    trace.observe_sinks(0, 4, np.array([0, 1]))
+    counts, fires = {4: 0}, {4: 0}
+    processor = PixArtSinkSuppressProcessor(
+        original, trace, 4, (0, 0), (4, 4), counts, fires, chunk_size=2
+    )
+    edited = processor(attention, hidden)
+    assert torch.equal(edited[0], clean[0])
+    assert not torch.allclose(edited[1], clean[1])
+    assert counts[4] == 1 and fires[4] == 1

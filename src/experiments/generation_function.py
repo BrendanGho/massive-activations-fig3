@@ -12,22 +12,22 @@ import hashlib
 import json
 import math
 import os
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
-
 
 CONDITIONS = (
     "baseline",
     "remove_vstar",
-    "suppress_channel_154",
+    "suppress_channel",
     "suppress_sink",
     "remove_top_registers",
     "norm_only",
 )
-EXPERIMENT_REVISION = "q7-generation-function-v2"
+EXPERIMENT_REVISION = "q7-generation-function-v3"
 GENEVAL_METRICS = (
     "geneval_counting",
     "geneval_attribute",
@@ -41,6 +41,7 @@ STRUCTURED_SCORE_KEYS = ("run_identity", "prompt_id", "seed", "condition", "phas
 class Q7Config:
     model_ckpt: str = "black-forest-labs/FLUX.1-dev"
     model_preset: str | None = None
+    model_family: str = "flux1"
     output_dir: str = "./q7_outputs"
     prompts: tuple[str, ...] = ()
     seeds: tuple[int, ...] = (0,)
@@ -68,7 +69,7 @@ class Q7Config:
     vstar_path: str | None = None
 
     @classmethod
-    def from_json(cls, path: str | os.PathLike[str]) -> "Q7Config":
+    def from_json(cls, path: str | os.PathLike[str]) -> Q7Config:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         for key in ("prompts", "seeds", "conditions"):
             if key in raw:
@@ -81,14 +82,17 @@ class Q7Config:
         return cfg
 
     def validate(self) -> None:
+        if self.model_family not in {"flux1", "pixart_sigma"}:
+            raise ValueError(f"unsupported Q7 model_family: {self.model_family!r}")
         bad = set(self.conditions) - set(CONDITIONS)
         if bad:
             raise ValueError(f"unknown conditions: {sorted(bad)}")
         if not self.prompts:
             raise ValueError("at least one prompt is required")
+        max_layer = 56 if self.model_family == "flux1" else 27
         for group, ranges, upper in (
             ("phases", self.phases, self.num_steps - 1),
-            ("zones", self.zones, 56),
+            ("zones", self.zones, max_layer),
         ):
             for name, (lo, hi) in ranges.items():
                 if lo < 0 or hi < lo or hi > upper:
@@ -108,24 +112,46 @@ def denoising_thirds(num_steps: int) -> dict[str, tuple[int, int]]:
     return {name: (edges[i], edges[i + 1] - 1) for i, name in enumerate(names)}
 
 
-def validate_flux1_layout(blocks: list[Any], cfg: Q7Config) -> None:
-    """Fail before generation unless block numbering matches the audited FLUX.1 layout."""
+def validate_model_layout(blocks: list[Any], cfg: Q7Config) -> None:
+    """Fail before generation unless the discovered layout matches the selected adapter."""
     layer_ids = [int(block.layer_id) for block in blocks]
     kinds = [block.kind for block in blocks]
-    expected_ids = list(range(57))
-    if layer_ids != expected_ids or kinds[:19] != ["double"] * 19 or kinds[19:] != ["single"] * 38:
-        raise RuntimeError(
-            "Q7 is audited for FLUX.1's 57 blocks (19 dual-stream + 38 single-stream); "
-            f"discovered {len(blocks)} blocks with kinds {kinds[:2]}...{kinds[-2:]}"
-        )
+    if cfg.model_family == "flux1":
+        expected_ids = list(range(57))
+        if (
+            layer_ids != expected_ids
+            or kinds[:19] != ["double"] * 19
+            or kinds[19:] != ["single"] * 38
+        ):
+            raise RuntimeError(
+                "Q7 FLUX.1 expects 57 blocks (19 dual-stream + 38 single-stream); "
+                f"discovered {len(blocks)} blocks with kinds {kinds[:2]}...{kinds[-2:]}"
+            )
+        attention = getattr(blocks[0].module, "attn", None)
+    else:
+        expected_ids = list(range(28))
+        if layer_ids != expected_ids:
+            raise RuntimeError(
+                "Q7 PixArt-Sigma expects 28 image-only transformer blocks; "
+                f"discovered layer ids {layer_ids}"
+            )
+        attention = getattr(blocks[0].module, "attn1", None)
+        if attention is None:
+            raise RuntimeError("Q7 PixArt-Sigma blocks must expose image self-attention as attn1")
     targeted = {layer for lo, hi in cfg.zones.values() for layer in range(lo, hi + 1)}
     missing = targeted - set(layer_ids)
     if missing:
         raise RuntimeError(f"Q7 depth zones reference missing layers: {sorted(missing)}")
-    attention = getattr(blocks[0].module, "attn", None)
     width = getattr(getattr(attention, "to_q", None), "in_features", None)
     if width is not None and not 0 <= cfg.channel < int(width):
-        raise RuntimeError(f"channel {cfg.channel} is outside the FLUX.1 residual width {width}")
+        raise RuntimeError(
+            f"channel {cfg.channel} is outside the {cfg.model_family} residual width {width}"
+        )
+
+
+def validate_flux1_layout(blocks: list[Any], cfg: Q7Config) -> None:
+    """Backward-compatible name for callers that validate the configured model adapter."""
+    validate_model_layout(blocks, cfg)
 
 
 def natural_register_mask(
@@ -170,7 +196,7 @@ def apply_numpy_intervention(
     mask = np.asarray(register_mask, dtype=bool)
     if condition == "baseline" or condition == "suppress_sink":
         return y
-    if condition == "suppress_channel_154":
+    if condition == "suppress_channel":
         y[..., channel] = 0
     elif condition == "remove_top_registers":
         y[mask] = 0
@@ -274,7 +300,7 @@ def generate_figures(cfg: Q7Config) -> list[Path]:
     phases, zones = list(cfg.phases), list(cfg.zones)
     pretty = {
         "remove_vstar": "Remove v*",
-        "suppress_channel_154": f"Suppress channel {cfg.channel}",
+        "suppress_channel": f"Suppress channel {cfg.channel}",
         "suppress_sink": "Suppress sink",
         "remove_top_registers": "Remove registers",
         "norm_only": "Norm only",
@@ -573,30 +599,48 @@ def audit_counts(
 
 
 def _torch_edit(x, condition: str, mask_np: np.ndarray, vstar, channel: int):
-    """Device-local version of the residual interventions."""
+    """Edit the conditional row only (the sole row for FLUX; last CFG row for PixArt)."""
     import torch
 
     y = x.clone()
     mask = torch.as_tensor(mask_np, device=y.device, dtype=torch.bool)
-    if condition == "suppress_channel_154":
-        y[..., channel] = 0
+    conditional = y[-1:]
+    if condition == "suppress_channel":
+        conditional[..., channel] = 0
     elif condition == "remove_top_registers":
-        y[:, mask, :] = 0
+        conditional[:, mask, :] = 0
     elif condition == "remove_vstar":
         v = torch.as_tensor(vstar, device=y.device, dtype=y.dtype)
         v = v / v.float().norm().to(y.dtype)
-        z = y[:, mask, :]
-        y[:, mask, :] = z - (z.float() @ v.float()).to(y.dtype).unsqueeze(-1) * v
+        z = conditional[:, mask, :]
+        conditional[:, mask, :] = z - (z.float() @ v.float()).to(y.dtype).unsqueeze(-1) * v
     elif condition == "norm_only":
-        z = y[:, mask, :]
-        all_norm = y.float().norm(dim=-1)
+        z = conditional[:, mask, :]
+        all_norm = conditional.float().norm(dim=-1)
         ordinary = all_norm[:, ~mask]
         target = (
             ordinary.median(dim=1).values if ordinary.shape[1] else all_norm.median(dim=1).values
         )
         scale = target[:, None] / z.float().norm(dim=-1).clamp_min(1e-12)
-        y[:, mask, :] = z * scale.to(z.dtype).unsqueeze(-1)
+        conditional[:, mask, :] = z * scale.to(z.dtype).unsqueeze(-1)
     return y
+
+
+def _infer_image_token_count(transformer, hidden_states) -> int:
+    """Infer sequence length from packed FLUX tokens or PixArt's pre-patch latent grid."""
+    if hidden_states.ndim == 3:
+        return int(hidden_states.shape[1])
+    if hidden_states.ndim == 4:
+        patch_size = int(getattr(transformer.config, "patch_size", 0))
+        if patch_size <= 0:
+            raise RuntimeError("cannot infer PixArt token count without a positive patch_size")
+        height, width = hidden_states.shape[-2:]
+        if height % patch_size or width % patch_size:
+            raise RuntimeError(
+                f"latent grid {(height, width)} is not divisible by patch_size={patch_size}"
+            )
+        return int((height // patch_size) * (width // patch_size))
+    raise RuntimeError(f"unsupported transformer hidden-state rank: {hidden_states.ndim}")
 
 
 def _modify_image_output(output: Any, n_image: int, fn):
@@ -728,6 +772,79 @@ class AttentionSinkTraceProcessor:
         )
 
 
+def _pixart_qkv(attn, hidden_states, encoder_hidden_states=None, temb=None):
+    """Construct the normalized Q/K/V used by PixArt's AttnProcessor2_0 self-attention."""
+    if encoder_hidden_states is not None:
+        raise RuntimeError("PixArt Q7 sink tracing must target attn1 self-attention, not attn2")
+    residual = hidden_states
+    if attn.spatial_norm is not None:
+        hidden_states = attn.spatial_norm(hidden_states, temb)
+    input_ndim = hidden_states.ndim
+    spatial_shape = None
+    if input_ndim == 4:
+        batch, channel, height, width = hidden_states.shape
+        spatial_shape = (channel, height, width)
+        hidden_states = hidden_states.view(batch, channel, height * width).transpose(1, 2)
+    if attn.group_norm is not None:
+        hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+    query = attn.to_q(hidden_states)
+    key = attn.to_k(hidden_states)
+    value = attn.to_v(hidden_states)
+    batch_size, sequence_length, inner_dim = query.shape
+    head_dim = inner_dim // attn.heads
+    query = query.view(batch_size, sequence_length, attn.heads, head_dim).transpose(1, 2)
+    key = key.view(batch_size, sequence_length, attn.heads, head_dim).transpose(1, 2)
+    value = value.view(batch_size, sequence_length, attn.heads, head_dim).transpose(1, 2)
+    if attn.norm_q is not None:
+        query = attn.norm_q(query)
+    if attn.norm_k is not None:
+        key = attn.norm_k(key)
+    return query, key, value, residual, input_ndim, spatial_shape
+
+
+def _pixart_incoming_attention_sinks(query, key, chunk_size: int = 128):
+    """Per-head incoming-attention argmax for PixArt image self-attention."""
+    # Reuse the FLUX helper after converting [B,H,Q,D] to [B,Q,H,D].
+    return _incoming_image_attention_sinks(
+        query.transpose(1, 2), key.transpose(1, 2), query.shape[2], chunk_size
+    )
+
+
+class PixArtAttentionSinkTraceProcessor:
+    """Record PixArt attn1 sinks while delegating the unmodified clean forward."""
+
+    def __init__(self, original, trace: NaturalTrace, layer: int, counter: dict[int, int]):
+        self.original, self.trace, self.layer, self.counter = original, trace, layer, counter
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        temb=None,
+        *args,
+        **kwargs,
+    ):
+        if attention_mask is not None:
+            raise RuntimeError("PixArt Q7 sink tracing does not support masked image tokens")
+        step = self.counter[self.layer]
+        self.counter[self.layer] += 1
+        query, key, _value, *_metadata = _pixart_qkv(
+            attn, hidden_states, encoder_hidden_states, temb
+        )
+        self.trace.observe_sinks(step, self.layer, _pixart_incoming_attention_sinks(query, key))
+        return self.original(
+            attn,
+            hidden_states,
+            encoder_hidden_states,
+            attention_mask,
+            temb,
+            *args,
+            **kwargs,
+        )
+
+
 def _suppressed_image_attention(query, key, value, n_image: int, sinks, chunk_size: int = 128):
     """Recompute image-query rows over all keys, masking one natural sink per head."""
     import torch
@@ -849,6 +966,86 @@ class SinkSuppressProcessor:
         return result
 
 
+class PixArtSinkSuppressProcessor:
+    """Suppress each clean-traced PixArt attn1 sink on the conditional CFG row only."""
+
+    def __init__(self, original, trace, layer, phase, zone, counts, fires, chunk_size=128):
+        self.original, self.trace, self.layer = original, trace, layer
+        self.phase, self.zone, self.counts, self.fires = phase, zone, counts, fires
+        self.chunk_size = chunk_size
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        temb=None,
+        *args,
+        **kwargs,
+    ):
+        import torch
+        from torch.nn import functional
+
+        output = self.original(
+            attn,
+            hidden_states,
+            encoder_hidden_states,
+            attention_mask,
+            temb,
+            *args,
+            **kwargs,
+        )
+        step = self.counts[self.layer]
+        self.counts[self.layer] += 1
+        if not in_target(step, self.layer, self.phase, self.zone):
+            return output
+        if attention_mask is not None:
+            raise RuntimeError("suppress_sink does not support masked PixArt image tokens")
+        sinks = self.trace.sink_indices.get((step, self.layer))
+        if sinks is None:
+            raise RuntimeError(f"clean attention trace missing step {step}, layer {self.layer}")
+        query, key, value, residual, input_ndim, spatial_shape = _pixart_qkv(
+            attn, hidden_states, encoder_hidden_states, temb
+        )
+        # PixArt real CFG is [unconditional, conditional]. Preserve the unconditional row.
+        query, key, value = query[-1:], key[-1:], value[-1:]
+        sinks = torch.as_tensor(sinks, device=query.device, dtype=torch.long)
+        heads = torch.arange(query.shape[1], device=query.device)
+        chunks = []
+        for lo in range(0, query.shape[2], self.chunk_size):
+            q = query[:, :, lo : lo + self.chunk_size]
+            mask = torch.zeros(
+                (1, q.shape[1], q.shape[2], key.shape[2]), device=q.device, dtype=q.dtype
+            )
+            mask[:, heads, :, sinks] = torch.finfo(q.dtype).min
+            chunks.append(
+                functional.scaled_dot_product_attention(
+                    q, key, value, attn_mask=mask, dropout_p=0.0, is_causal=False
+                )
+            )
+        edited = torch.cat(chunks, dim=2).transpose(1, 2).reshape(1, query.shape[2], -1)
+        edited = attn.to_out[0](edited)
+        edited = attn.to_out[1](edited)
+        if input_ndim == 4:
+            channel, height, width = spatial_shape
+            edited = edited.transpose(-1, -2).reshape(1, channel, height, width)
+        if attn.residual_connection:
+            edited = edited + residual[-1:]
+        edited = edited / attn.rescale_output_factor
+        if not torch.is_tensor(output) or output.shape[0] != hidden_states.shape[0]:
+            raise RuntimeError("unexpected PixArt attn1 processor output contract")
+        result = output.clone()
+        result[-1:] = edited.to(result.dtype)
+        self.fires[self.layer] += 1
+        return result
+
+
+def _block_self_attention(ref, model_family: str):
+    attr = "attn" if model_family == "flux1" else "attn1"
+    return getattr(ref.module, attr, None)
+
+
 class ResidualInterventionHooks:
     """Post-block hooks using masks fixed by the paired clean run."""
 
@@ -860,7 +1057,7 @@ class ResidualInterventionHooks:
     def attach(self, transformer):
         def pre(_m, _a, kw):
             hs = kw.get("hidden_states")
-            self.n_image = int(hs.shape[1])
+            self.n_image = _infer_image_token_count(transformer, hs)
 
         self.handles.append(transformer.register_forward_pre_hook(pre, with_kwargs=True))
         for ref in self.blocks:
@@ -898,22 +1095,28 @@ class ResidualInterventionHooks:
 
 
 class SinkAttentionHooks:
-    """Replace FLUX processors temporarily to suppress clean-traced natural sink routing."""
+    """Replace self-attention processors to suppress clean-traced natural sink routing."""
 
-    def __init__(self, blocks, trace, phase, zone, n_steps):
+    def __init__(self, blocks, trace, phase, zone, n_steps, model_family="flux1"):
         self.blocks, self.trace, self.phase, self.zone = blocks, trace, phase, zone
+        self.model_family = model_family
         self.n_steps, self.counts, self.fires, self.originals = n_steps, {}, {}, []
 
     def attach(self):
         for ref in self.blocks:
-            attn = getattr(ref.module, "attn", None)
+            attn = _block_self_attention(ref, self.model_family)
             if attn is None or not hasattr(attn, "processor") or not hasattr(attn, "set_processor"):
                 raise RuntimeError(f"block {ref.layer_id} has no replaceable attention processor")
             self.counts[ref.layer_id] = 0
             self.fires[ref.layer_id] = 0
             self.originals.append((attn, attn.processor))
+            processor_class = (
+                SinkSuppressProcessor
+                if self.model_family == "flux1"
+                else PixArtSinkSuppressProcessor
+            )
             attn.set_processor(
-                SinkSuppressProcessor(
+                processor_class(
                     attn.processor,
                     self.trace,
                     ref.layer_id,
@@ -939,14 +1142,14 @@ def _generate(pipe, cfg: Q7Config, prompt: str, seed: int):
 
     gen_device = "cpu" if cfg.device == "cuda" else cfg.device
     generator = torch.Generator(gen_device).manual_seed(seed)
-    kwargs = dict(
-        prompt=prompt,
-        height=cfg.resolution,
-        width=cfg.resolution,
-        num_inference_steps=cfg.num_steps,
-        generator=generator,
-        output_type="pil",
-    )
+    kwargs = {
+        "prompt": prompt,
+        "height": cfg.resolution,
+        "width": cfg.resolution,
+        "num_inference_steps": cfg.num_steps,
+        "generator": generator,
+        "output_type": "pil",
+    }
     if cfg.guidance_scale is not None:
         kwargs["guidance_scale"] = cfg.guidance_scale
     with torch.inference_mode():
@@ -966,20 +1169,25 @@ def _trace_clean(pipe, blocks, cfg, prompt, seed, capture_sinks: bool = True):
     attention_counters = {b.layer_id: 0 for b in blocks if b.layer_id in sink_layers}
 
     def pre(_m, _a, kw):
-        state["n_image"] = int(kw["hidden_states"].shape[1])
+        state["n_image"] = _infer_image_token_count(pipe.transformer, kw["hidden_states"])
         trace.n_image = state["n_image"]
 
     handles.append(pipe.transformer.register_forward_pre_hook(pre, with_kwargs=True))
     for ref in blocks:
         if capture_sinks and ref.layer_id in sink_layers:
-            attn = getattr(ref.module, "attn", None)
+            attn = _block_self_attention(ref, cfg.model_family)
             if attn is None or not hasattr(attn, "processor") or not hasattr(attn, "set_processor"):
                 raise RuntimeError(
                     f"block {ref.layer_id} does not expose a replaceable attention processor"
                 )
             original_processors.append((attn, attn.processor))
+            processor_class = (
+                AttentionSinkTraceProcessor
+                if cfg.model_family == "flux1"
+                else PixArtAttentionSinkTraceProcessor
+            )
             attn.set_processor(
-                AttentionSinkTraceProcessor(attn.processor, trace, ref.layer_id, attention_counters)
+                processor_class(attn.processor, trace, ref.layer_id, attention_counters)
             )
 
         def hook(_m, _a, out, layer=ref.layer_id):
@@ -1027,7 +1235,7 @@ def calibrate_vstar(cfg: Q7Config, smoke: bool = False) -> Path:
     )()
     pipe = load_pipeline(pipe_cfg, offload=cfg.offload)
     blocks = discover_blocks(pipe.transformer)
-    validate_flux1_layout(blocks, cfg)
+    validate_model_layout(blocks, cfg)
     jobs = [(p, s) for p in cfg.prompts for s in cfg.seeds]
     if smoke:
         jobs = jobs[:1]
@@ -1043,6 +1251,7 @@ def calibrate_vstar(cfg: Q7Config, smoke: bool = False) -> Path:
     metadata = {
         "path": str(path),
         "model_preset": cfg.model_preset,
+        "model_family": cfg.model_family,
         "model_ckpt": cfg.model_ckpt,
         "n_vectors": len(vectors),
         "n_scenarios": len(jobs),
@@ -1065,7 +1274,7 @@ def run(cfg: Q7Config, smoke: bool = False) -> None:
     )()
     pipe = load_pipeline(pipe_cfg, offload=cfg.offload)
     blocks = discover_blocks(pipe.transformer)
-    validate_flux1_layout(blocks, cfg)
+    validate_model_layout(blocks, cfg)
     out = Path(cfg.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     calibrated = Path(cfg.vstar_path) if cfg.vstar_path else out / "vstar.npy"
@@ -1079,6 +1288,7 @@ def run(cfg: Q7Config, smoke: bool = False) -> None:
     generation_params = {
         "experiment_revision": EXPERIMENT_REVISION,
         "model_preset": cfg.model_preset,
+        "model_family": cfg.model_family,
         "model_ckpt": cfg.model_ckpt,
         "resolution": cfg.resolution,
         "num_steps": cfg.num_steps,
@@ -1136,7 +1346,7 @@ def run(cfg: Q7Config, smoke: bool = False) -> None:
                         continue
                     if condition == "suppress_sink":
                         hooks = SinkAttentionHooks(
-                            blocks, trace, phase, zone, cfg.num_steps
+                            blocks, trace, phase, zone, cfg.num_steps, cfg.model_family
                         ).attach()
                     else:
                         hooks = ResidualInterventionHooks(
@@ -1164,20 +1374,20 @@ def run(cfg: Q7Config, smoke: bool = False) -> None:
                     )
                     image_path = out / "images" / f"{stem}.png"
                     _save_image(image, image_path)
-                    row = dict(
-                        prompt_id=prompt_id,
-                        prompt=prompt,
-                        seed=seed,
-                        condition=condition,
-                        phase=phase_name,
-                        zone=zone_name,
-                        clean_path=str(clean_path),
-                        image_path=str(image_path),
-                        config_hash=config_hash(cfg),
-                        run_identity=identity,
-                        generation_params=generation_params,
-                        intervention_audit=audit,
-                    )
+                    row = {
+                        "prompt_id": prompt_id,
+                        "prompt": prompt,
+                        "seed": seed,
+                        "condition": condition,
+                        "phase": phase_name,
+                        "zone": zone_name,
+                        "clean_path": str(clean_path),
+                        "image_path": str(image_path),
+                        "config_hash": config_hash(cfg),
+                        "run_identity": identity,
+                        "generation_params": generation_params,
+                        "intervention_audit": audit,
+                    }
                     with manifest.open("a", encoding="utf-8") as fh:
                         fh.write(json.dumps(row, sort_keys=True) + "\n")
 
