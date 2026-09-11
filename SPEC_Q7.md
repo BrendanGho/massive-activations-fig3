@@ -34,6 +34,8 @@ resolution, and step count are identical within every pair.
 - `paired_metrics.csv`: LPIPS, CLIP, optional ImageReward, low-frequency and high-frequency
   paired distances, plus optional GenEval-style scores supplied by a structured evaluator.
 - `summary.csv` with paired bootstrap confidence intervals by condition, time phase, and zone.
+- Optional externally computed GenEval-style clean/edited scores are matched by the full run-cell
+  identity, range-checked, converted to paired deltas, and included in the summary and figures.
 - `figures/q7_causal_map.png` and `q7_frequency_profile.png` for temporal/depth and
   low-/high-frequency effects, plus paired prompt-fidelity and `vstar` loading plots.
 - A representative contact sheet that exposes clean/intervened/amplified-difference images.
@@ -45,7 +47,11 @@ resolution, and step count are identical within every pair.
   operator preserves direction while matching the requested norm.
 - Phase and depth targeting are inclusive, deterministic, and fire only in the requested cells.
 - Register masks are selected from the clean trace with the paper's 3x-median, top-8 rule.
+- `vstar` is fitted only from high-norm tokens in the configured register-zone layers,
+  pooled across the calibration prompts, seeds, denoising steps, and those layers.
 - Sink suppression edits attention routing only; it does not overwrite the residual-stream token.
+  Edited image-query rows use the pinned Diffusers attention dispatcher, model dtype, and active
+  backend with only the per-head natural-sink key masked; clean text-query outputs are retained.
 - A smoke mode runs one baseline plus every condition in one phase/zone and asserts both total
   forward counts and actual targeted edit counts before a full run.
 - Every generated pair records all generation parameters and hashes the experiment config.

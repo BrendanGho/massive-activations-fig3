@@ -1,4 +1,5 @@
 import csv
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -7,17 +8,21 @@ from src.experiments.generation_function import (
     NaturalTrace,
     Q7Config,
     SinkSuppressProcessor,
+    _dispatch_suppressed_image_attention,
     _suppressed_image_attention,
     add_paired_prompt_deltas,
     apply_numpy_intervention,
     audit_counts,
+    denoising_thirds,
     fit_vstar,
     frequency_distances,
     generate_figures,
     in_target,
+    load_structured_scores,
     natural_register_mask,
     paired_bootstrap,
     run_identity,
+    validate_flux1_layout,
 )
 
 
@@ -25,6 +30,21 @@ def test_targeting_is_inclusive():
     assert in_target(2, 10, (2, 4), (10, 12))
     assert in_target(4, 12, (2, 4), (10, 12))
     assert not in_target(5, 12, (2, 4), (10, 12))
+
+
+def test_denoising_thirds_are_exhaustive_for_both_flux1_presets():
+    assert denoising_thirds(4) == {"early": (0, 0), "middle": (1, 2), "late": (3, 3)}
+    assert denoising_thirds(28) == {
+        "early": (0, 8),
+        "middle": (9, 18),
+        "late": (19, 27),
+    }
+
+
+def test_q7_rejects_non_flux1_block_layout():
+    blocks = [SimpleNamespace(layer_id=i, kind="block", module=None) for i in range(28)]
+    with pytest.raises(RuntimeError, match="57 blocks"):
+        validate_flux1_layout(blocks, Q7Config(prompts=("p",)))
 
 
 def test_register_mask_threshold_and_cap():
@@ -153,6 +173,17 @@ def test_attention_sinks_are_traced_separately_from_registers():
     assert trace.masks[(1, 2)].tolist() == [True, False, False]
 
 
+def test_vstar_trace_only_pools_configured_register_layers():
+    torch = pytest.importorskip("torch")
+    trace = NaturalTrace(3.0, 8, vector_layers={2})
+    hidden = torch.ones(1, 4, 2)
+    hidden[:, 0] = 10
+    trace.observe(0, 1, hidden)
+    assert trace.vectors == []
+    trace.observe(0, 2, hidden)
+    assert len(trace.vectors) == 1
+
+
 def test_audit_checks_calls_and_actual_target_fires():
     calls = {0: 5, 1: 5, 2: 5}
     fires = {0: 0, 1: 3, 2: 0}
@@ -180,6 +211,44 @@ def test_prompt_fidelity_effects_are_edited_minus_clean():
     assert np.isclose(row["image_reward_delta"], 0.25)
 
 
+def test_structured_scores_match_exact_run_cells_and_validate_range(tmp_path):
+    path = tmp_path / "structured.csv"
+    fields = [
+        "run_identity",
+        "prompt_id",
+        "seed",
+        "condition",
+        "phase",
+        "zone",
+        "geneval_counting_clean",
+        "geneval_counting_edited",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fields)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "run_identity": "current",
+                "prompt_id": 0,
+                "seed": 42,
+                "condition": "remove_vstar",
+                "phase": "early",
+                "zone": "writer",
+                "geneval_counting_clean": 1,
+                "geneval_counting_edited": 0,
+            }
+        )
+    scores = load_structured_scores(path, "current")
+    key = ("current", "0", "42", "remove_vstar", "early", "writer")
+    assert scores[key]["geneval_counting_clean"] == 1
+    assert scores[key]["geneval_counting_edited"] == 0
+
+    text = path.read_text(encoding="utf-8").replace(",0\n", ",2\n")
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match=r"in \[0, 1\]"):
+        load_structured_scores(path, "current")
+
+
 def test_sink_suppression_is_per_head():
     torch = pytest.importorskip("torch")
     query = torch.ones(1, 2, 2, 1)
@@ -189,6 +258,17 @@ def test_sink_suppression_is_per_head():
     # Head 0 suppresses image key 0; head 1 suppresses image key 1. Text remains available.
     assert result.shape == (1, 2, 2, 1)
     assert not torch.allclose(result[:, :, 0], result[:, :, 1])
+
+
+def test_native_sink_suppression_matches_reference_attention():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
+    query = torch.ones(1, 2, 2, 1)
+    key = torch.ones(1, 3, 2, 1)
+    value = torch.tensor([[[[100.0], [100.0]], [[1.0], [10.0]], [[2.0], [20.0]]]])
+    reference = _suppressed_image_attention(query, key, value, n_image=2, sinks=[0, 1])
+    native = _dispatch_suppressed_image_attention(query, key, value, n_image=2, sinks=[0, 1])
+    assert torch.allclose(native, reference, atol=1e-5)
 
 
 def test_sink_processor_preserves_double_stream_text_output_identity():
@@ -203,7 +283,14 @@ def test_sink_processor_preserves_double_stream_text_output_identity():
             self.to_q = self.to_k = self.to_v = lambda x: x
             self.add_q_proj = self.add_k_proj = self.add_v_proj = lambda x: x
             self.norm_q = self.norm_k = lambda x: x
-            self.to_out = [lambda x: x, lambda x: x]
+            self.norm_added_q = self.norm_added_k = lambda x: x
+            self.dropout_calls = 0
+
+            def dropout(x):
+                self.dropout_calls += 1
+                return x
+
+            self.to_out = [lambda x: x, dropout]
 
     text_sentinel = torch.randn(1, 1, 2)
 
@@ -215,10 +302,12 @@ def test_sink_processor_preserves_double_stream_text_output_identity():
     trace.observe_sinks(0, 1, np.array([0, 1]))
     counts, fires = {1: 0}, {1: 0}
     processor = SinkSuppressProcessor(original, trace, 1, (0, 0), (1, 1), counts, fires)
+    attention = FakeAttention()
     output = processor(
-        FakeAttention(),
+        attention,
         torch.randn(1, 2, 2),
         encoder_hidden_states=torch.randn(1, 1, 2),
     )
     assert output[1] is text_sentinel
+    assert attention.dropout_calls == 1
     assert counts[1] == 1 and fires[1] == 1

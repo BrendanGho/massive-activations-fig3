@@ -27,11 +27,20 @@ CONDITIONS = (
     "remove_top_registers",
     "norm_only",
 )
+EXPERIMENT_REVISION = "q7-generation-function-v2"
+GENEVAL_METRICS = (
+    "geneval_counting",
+    "geneval_attribute",
+    "geneval_spatial",
+    "geneval_overall",
+)
+STRUCTURED_SCORE_KEYS = ("run_identity", "prompt_id", "seed", "condition", "phase", "zone")
 
 
 @dataclass(frozen=True)
 class Q7Config:
     model_ckpt: str = "black-forest-labs/FLUX.1-dev"
+    model_preset: str | None = None
     output_dir: str = "./q7_outputs"
     prompts: tuple[str, ...] = ()
     seeds: tuple[int, ...] = (0,)
@@ -88,6 +97,35 @@ class Q7Config:
 
 def in_target(step: int, layer: int, phase: tuple[int, int], zone: tuple[int, int]) -> bool:
     return phase[0] <= step <= phase[1] and zone[0] <= layer <= zone[1]
+
+
+def denoising_thirds(num_steps: int) -> dict[str, tuple[int, int]]:
+    """Split a schedule into exhaustive early/middle/late integer ranges."""
+    if num_steps < 3:
+        raise ValueError("at least three denoising steps are required")
+    edges = [round(i * num_steps / 3) for i in range(4)]
+    names = ("early", "middle", "late")
+    return {name: (edges[i], edges[i + 1] - 1) for i, name in enumerate(names)}
+
+
+def validate_flux1_layout(blocks: list[Any], cfg: Q7Config) -> None:
+    """Fail before generation unless block numbering matches the audited FLUX.1 layout."""
+    layer_ids = [int(block.layer_id) for block in blocks]
+    kinds = [block.kind for block in blocks]
+    expected_ids = list(range(57))
+    if layer_ids != expected_ids or kinds[:19] != ["double"] * 19 or kinds[19:] != ["single"] * 38:
+        raise RuntimeError(
+            "Q7 is audited for FLUX.1's 57 blocks (19 dual-stream + 38 single-stream); "
+            f"discovered {len(blocks)} blocks with kinds {kinds[:2]}...{kinds[-2:]}"
+        )
+    targeted = {layer for lo, hi in cfg.zones.values() for layer in range(lo, hi + 1)}
+    missing = targeted - set(layer_ids)
+    if missing:
+        raise RuntimeError(f"Q7 depth zones reference missing layers: {sorted(missing)}")
+    attention = getattr(blocks[0].module, "attn", None)
+    width = getattr(getattr(attention, "to_q", None), "in_features", None)
+    if width is not None and not 0 <= cfg.channel < int(width):
+        raise RuntimeError(f"channel {cfg.channel} is outside the FLUX.1 residual width {width}")
 
 
 def natural_register_mask(
@@ -322,18 +360,24 @@ def generate_figures(cfg: Q7Config) -> list[Path]:
     # Paired prompt-fidelity effects. A singleton smoke run remains visibly n=1.
     fidelity = [
         metric
-        for metric in ("clip_delta", "image_reward_delta")
+        for metric in (
+            "clip_delta",
+            "image_reward_delta",
+            *(f"{name}_delta" for name in GENEVAL_METRICS),
+        )
         if _finite_metric_values(rows, metric)
     ]
     if fidelity:
+        ncols = min(3, len(fidelity))
+        nrows = math.ceil(len(fidelity) / ncols)
         fig, axes = plt.subplots(
-            1,
-            len(fidelity),
-            figsize=(7.0 * len(fidelity), 4.8),
+            nrows,
+            ncols,
+            figsize=(6.0 * ncols, 4.8 * nrows),
             squeeze=False,
             constrained_layout=True,
         )
-        for ax, metric in zip(axes[0], fidelity):
+        for ax, metric in zip(axes.flat, fidelity):
             for yi, condition in enumerate(conditions):
                 values = _scenario_metric_values(condition_rows[condition], metric)
                 stats = paired_bootstrap(values)
@@ -354,10 +398,20 @@ def generate_figures(cfg: Q7Config) -> list[Path]:
             ax.axvline(0, color="#888888", linewidth=1, linestyle="--")
             ax.set_yticks(range(len(conditions)), [pretty.get(c, c) for c in conditions])
             ax.set_xlabel("Edited − clean score")
-            ax.set_title("CLIP" if metric == "clip_delta" else "ImageReward")
+            metric_title = {
+                "clip_delta": "CLIP",
+                "image_reward_delta": "ImageReward",
+                "geneval_counting_delta": "GenEval counting",
+                "geneval_attribute_delta": "GenEval attributes",
+                "geneval_spatial_delta": "GenEval spatial",
+                "geneval_overall_delta": "GenEval overall",
+            }
+            ax.set_title(metric_title[metric])
             ax.tick_params(axis="x", labelsize=8)
             ax.xaxis.set_major_locator(MaxNLocator(5))
             ax.spines[["top", "right"]].set_visible(False)
+        for ax in axes.flat[len(fidelity) :]:
+            ax.set_visible(False)
         fig.suptitle("Q7 paired prompt-fidelity effects (95% bootstrap CI)")
         path = figures / "q7_prompt_fidelity.png"
         fig.savefig(path, dpi=200, bbox_inches="tight")
@@ -427,11 +481,48 @@ def generate_figures(cfg: Q7Config) -> list[Path]:
 
 def add_paired_prompt_deltas(row: dict[str, Any]) -> None:
     """Add edited-minus-clean effects for every available prompt-fidelity metric."""
-    for metric in ("clip", "image_reward"):
+    for metric in ("clip", "image_reward", *GENEVAL_METRICS):
         clean, edited = row.get(f"{metric}_clean"), row.get(f"{metric}_edited")
         row[f"{metric}_delta"] = (
             None if clean is None or edited is None else float(edited) - float(clean)
         )
+
+
+def _structured_score_key(row: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(str(row.get(name, "")) for name in STRUCTURED_SCORE_KEYS)
+
+
+def load_structured_scores(
+    path: str | os.PathLike[str], expected_identity: str
+) -> dict[tuple[str, ...], dict[str, float | None]]:
+    """Load externally computed GenEval-style clean/edited scores for exact run cells."""
+    with Path(path).open(newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        fields = set(reader.fieldnames or [])
+        missing = set(STRUCTURED_SCORE_KEYS) - fields
+        if missing:
+            raise ValueError(f"structured score CSV missing key columns: {sorted(missing)}")
+        rows = list(reader)
+    scores = {}
+    for row in rows:
+        if row["run_identity"] != expected_identity:
+            continue
+        key = _structured_score_key(row)
+        if key in scores:
+            raise ValueError(f"duplicate structured score key: {key}")
+        values = {}
+        for metric in GENEVAL_METRICS:
+            for suffix in ("clean", "edited"):
+                name = f"{metric}_{suffix}"
+                raw = row.get(name, "")
+                value = None if raw == "" else float(raw)
+                if value is not None and (not np.isfinite(value) or not 0 <= value <= 1):
+                    raise ValueError(f"{name} must be finite and in [0, 1], got {value}")
+                values[name] = value
+        scores[key] = values
+    if not scores:
+        raise ValueError(f"structured score CSV has no rows for run identity {expected_identity}")
+    return scores
 
 
 def config_hash(cfg: Q7Config) -> str:
@@ -451,7 +542,7 @@ def run_identity(
     cfg: Q7Config, calibration_sha256: str, scheduler_config: dict[str, Any] | None = None
 ) -> str:
     scheduler_json = json.dumps(scheduler_config or {}, sort_keys=True, separators=(",", ":"))
-    payload = f"{config_hash(cfg)}:{calibration_sha256}:{scheduler_json}"
+    payload = f"{EXPERIMENT_REVISION}:{config_hash(cfg)}:{calibration_sha256}:{scheduler_json}"
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -531,8 +622,9 @@ def _modify_image_output(output: Any, n_image: int, fn):
 class NaturalTrace:
     """Clean-run register masks, vectors, and per-head attention sinks."""
 
-    def __init__(self, threshold: float, max_registers: int):
+    def __init__(self, threshold: float, max_registers: int, vector_layers: set[int] | None = None):
         self.threshold, self.max_registers = threshold, max_registers
+        self.vector_layers = vector_layers
         self.masks: dict[tuple[int, int], np.ndarray] = {}
         self.sink_indices: dict[tuple[int, int], np.ndarray] = {}
         self.vectors: list[np.ndarray] = []
@@ -542,7 +634,7 @@ class NaturalTrace:
         arr = x[-1].detach().float().cpu().numpy()
         mask = natural_register_mask(arr, self.threshold, self.max_registers)
         self.masks[(step, layer)] = mask
-        if mask.any():
+        if mask.any() and (self.vector_layers is None or layer in self.vector_layers):
             self.vectors.extend(arr[mask])
 
     def observe_sinks(self, step: int, layer: int, indices: np.ndarray) -> None:
@@ -657,6 +749,47 @@ def _suppressed_image_attention(query, key, value, n_image: int, sinks, chunk_si
     return torch.cat(chunks, dim=1).to(query.dtype)
 
 
+def _dispatch_suppressed_image_attention(
+    query,
+    key,
+    value,
+    n_image: int,
+    sinks,
+    *,
+    backend=None,
+    parallel_config=None,
+    chunk_size: int = 128,
+):
+    """Use Diffusers' native backend/dtype with an additive per-head sink mask."""
+    import torch
+    from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+    image_query = query[:, -n_image:]
+    sinks = torch.as_tensor(sinks, device=query.device, dtype=torch.long)
+    key_offset = key.shape[1] - n_image
+    heads = torch.arange(query.shape[2], device=query.device)
+    chunks = []
+    for lo in range(0, n_image, chunk_size):
+        q = image_query[:, lo : lo + chunk_size]
+        mask = torch.zeros(
+            (q.shape[0], q.shape[2], q.shape[1], key.shape[1]),
+            device=q.device,
+            dtype=q.dtype,
+        )
+        mask[:, heads, :, key_offset + sinks] = torch.finfo(q.dtype).min
+        chunks.append(
+            dispatch_attention_fn(
+                q,
+                key,
+                value,
+                attn_mask=mask,
+                backend=backend,
+                parallel_config=parallel_config,
+            )
+        )
+    return torch.cat(chunks, dim=1).to(query.dtype)
+
+
 class SinkSuppressProcessor:
     """Delegating processor that changes image-query routing and preserves text-query output."""
 
@@ -693,7 +826,15 @@ class SinkSuppressProcessor:
         if self.trace.n_image is None:
             raise RuntimeError("clean trace has no image-token count")
         query, key, value = _flux_qkv(attn, hidden_states, encoder_hidden_states, image_rotary_emb)
-        image = _suppressed_image_attention(query, key, value, self.trace.n_image, sinks)
+        image = _dispatch_suppressed_image_attention(
+            query,
+            key,
+            value,
+            self.trace.n_image,
+            sinks,
+            backend=getattr(self.original, "_attention_backend", None),
+            parallel_config=getattr(self.original, "_parallel_config", None),
+        )
         image = image.flatten(2, 3).to(query.dtype)
         if encoder_hidden_states is not None:
             # Double-stream processor output is (projected image, projected text).
@@ -813,12 +954,15 @@ def _generate(pipe, cfg: Q7Config, prompt: str, seed: int):
 
 
 def _trace_clean(pipe, blocks, cfg, prompt, seed, capture_sinks: bool = True):
-    trace = NaturalTrace(cfg.register_threshold, cfg.max_registers)
+    register_layers = {
+        layer for lo, hi in cfg.zones.values() for layer in range(int(lo), int(hi) + 1)
+    }
+    trace = NaturalTrace(cfg.register_threshold, cfg.max_registers, register_layers)
     counters = {b.layer_id: 0 for b in blocks}
     state = {"n_image": None}
     handles = []
     original_processors = []
-    sink_layers = {layer for lo, hi in cfg.zones.values() for layer in range(int(lo), int(hi) + 1)}
+    sink_layers = register_layers
     attention_counters = {b.layer_id: 0 for b in blocks if b.layer_id in sink_layers}
 
     def pre(_m, _a, kw):
@@ -873,7 +1017,7 @@ def _save_image(image, path: Path):
 
 
 def calibrate_vstar(cfg: Q7Config, smoke: bool = False) -> Path:
-    """Pool clean natural-register vectors across prompt/seed scenarios and save v*."""
+    """Pool clean register-zone vectors across prompts, seeds, steps, and layers."""
     from src.common.model_utils import discover_blocks, load_pipeline
 
     pipe_cfg = type(
@@ -883,6 +1027,7 @@ def calibrate_vstar(cfg: Q7Config, smoke: bool = False) -> Path:
     )()
     pipe = load_pipeline(pipe_cfg, offload=cfg.offload)
     blocks = discover_blocks(pipe.transformer)
+    validate_flux1_layout(blocks, cfg)
     jobs = [(p, s) for p in cfg.prompts for s in cfg.seeds]
     if smoke:
         jobs = jobs[:1]
@@ -897,9 +1042,15 @@ def calibrate_vstar(cfg: Q7Config, smoke: bool = False) -> Path:
     np.save(path, fit_vstar(np.asarray(vectors)))
     metadata = {
         "path": str(path),
+        "model_preset": cfg.model_preset,
+        "model_ckpt": cfg.model_ckpt,
         "n_vectors": len(vectors),
         "n_scenarios": len(jobs),
+        "calibration_layers": sorted(
+            {layer for lo, hi in cfg.zones.values() for layer in range(lo, hi + 1)}
+        ),
         "config_hash": config_hash(cfg),
+        "experiment_revision": EXPERIMENT_REVISION,
     }
     path.with_suffix(".json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return path
@@ -914,6 +1065,7 @@ def run(cfg: Q7Config, smoke: bool = False) -> None:
     )()
     pipe = load_pipeline(pipe_cfg, offload=cfg.offload)
     blocks = discover_blocks(pipe.transformer)
+    validate_flux1_layout(blocks, cfg)
     out = Path(cfg.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     calibrated = Path(cfg.vstar_path) if cfg.vstar_path else out / "vstar.npy"
@@ -925,6 +1077,8 @@ def run(cfg: Q7Config, smoke: bool = False) -> None:
     calibration_sha = file_sha256(calibrated)
     identity = run_identity(cfg, calibration_sha, scheduler_config)
     generation_params = {
+        "experiment_revision": EXPERIMENT_REVISION,
+        "model_preset": cfg.model_preset,
         "model_ckpt": cfg.model_ckpt,
         "resolution": cfg.resolution,
         "num_steps": cfg.num_steps,
@@ -1028,7 +1182,7 @@ def run(cfg: Q7Config, smoke: bool = False) -> None:
                         fh.write(json.dumps(row, sort_keys=True) + "\n")
 
 
-def evaluate(cfg: Q7Config) -> None:
+def evaluate(cfg: Q7Config, structured_scores_path: str | None = None) -> None:
     """Compute paired perceptual, prompt-fidelity, and frequency-band metrics.
 
     LPIPS, OpenCLIP, and ImageReward are optional: absent packages produce explicit blank
@@ -1048,6 +1202,7 @@ def evaluate(cfg: Q7Config) -> None:
         row["run_identity"]
         for row in manifest_rows
         if row.get("config_hash") == config_hash(cfg)
+        and row.get("generation_params", {}).get("experiment_revision") == EXPERIMENT_REVISION
         and row.get("generation_params", {}).get("calibration_sha256") == calibration_sha
     }
     if len(identities) != 1:
@@ -1055,6 +1210,11 @@ def evaluate(cfg: Q7Config) -> None:
             f"expected exactly one compatible run identity, found {sorted(identities)}"
         )
     identity = identities.pop()
+    structured_scores = (
+        load_structured_scores(structured_scores_path, identity)
+        if structured_scores_path is not None
+        else None
+    )
     rows = []
     lpips_model = clip_model = clip_preprocess = clip_tokenizer = reward_model = None
     try:
@@ -1095,6 +1255,19 @@ def evaluate(cfg: Q7Config) -> None:
             image_reward_edited=None,
             image_reward_delta=None,
         )
+        for metric in GENEVAL_METRICS:
+            row.update(
+                {
+                    f"{metric}_clean": None,
+                    f"{metric}_edited": None,
+                    f"{metric}_delta": None,
+                }
+            )
+        if structured_scores is not None:
+            key = _structured_score_key(row)
+            if key not in structured_scores:
+                raise ValueError(f"structured score CSV is missing run cell {key}")
+            row.update(structured_scores[key])
         if lpips_model is not None:
             import torch
 
@@ -1132,6 +1305,7 @@ def evaluate(cfg: Q7Config) -> None:
         "low_high_ratio",
         "clip_delta",
         "image_reward_delta",
+        *(f"{metric}_delta" for metric in GENEVAL_METRICS),
     ]
     grouped: dict[tuple[str, str, str, str], list[float]] = {}
     for row in rows:
@@ -1165,6 +1339,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--config", required=True)
     p.add_argument("--smoke", action="store_true")
     p.add_argument("--evaluate", action="store_true")
+    p.add_argument(
+        "--structured-scores",
+        help="optional GenEval-style clean/edited CSV to merge during --evaluate",
+    )
     p.add_argument("--plot", action="store_true", help="regenerate figures from paired_metrics.csv")
     p.add_argument("--calibrate-vstar", action="store_true")
     args = p.parse_args(argv)
@@ -1172,7 +1350,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.calibrate_vstar:
         print(calibrate_vstar(cfg, smoke=args.smoke))
     elif args.evaluate:
-        evaluate(cfg)
+        evaluate(cfg, structured_scores_path=args.structured_scores)
     elif args.plot:
         for figure in generate_figures(cfg):
             print(figure)

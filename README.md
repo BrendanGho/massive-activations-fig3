@@ -268,11 +268,30 @@ python -m src.experiments text --config configs/highnorm_tokens.yaml --layers al
 ## Q7 generation-level function
 
 Part 5 of the Colab provides a `Q7_ACTIVE_MODEL` dropdown for `flux-schnell` and
-`flux1-dev`. With `Q7_USE_PRESET_SCHEDULE=True`, selecting the model also selects the
-appropriate denoising schedule: four steps without CFG for Schnell, or 28 steps with
-guidance 3.5 for Dev. The denoising thirds are derived from that step count automatically.
+`flux1-dev`. All model-specific Q7 values come from the notebook's shared `MODEL_PRESETS`:
+checkpoint, resolution, schedule, guidance, memory threshold, dominant channel, and depth
+zones. Schnell uses four steps without CFG; Dev uses 28 steps with guidance 3.5. The
+denoising thirds are derived from the selected preset's step count automatically.
 The Q7 hooks and writer/register/dissolution zones are FLUX.1-specific; PixArt-Sigma and
 FLUX.2 are therefore intentionally not offered by this selector.
+
+`vstar` calibration follows the paper's scope: unit-normalized high-norm tokens are pooled
+across configured prompts, seeds, denoising steps, and only the preset's register-zone
+layers (18-39), not unrelated outliers from all 57 layers. A versioned run identity prevents
+results produced by an older intervention implementation from being resumed as current runs.
+The depth conditions are sustained zone interventions (1 writer layer, then 4, 12, and 5
+layers), not dose-matched single-layer ablations; interpret the causal map as regime-level
+suppression and use the recorded per-layer fire counts when comparing effect magnitude.
+
+For GenEval-style counting, attribute, and spatial-relation evaluation, set the Colab's
+`Q7_STRUCTURED_SCORES_PATH` to a CSV produced by the chosen structured evaluator. It must
+contain the exact key columns `run_identity,prompt_id,seed,condition,phase,zone` and may
+contain clean/edited pairs named `geneval_counting_{clean,edited}`,
+`geneval_attribute_{clean,edited}`, `geneval_spatial_{clean,edited}`, and
+`geneval_overall_{clean,edited}`. Scores are validated in `[0,1]`, merged only into their
+exact run cells, converted to edited-minus-clean effects, bootstrapped in `summary.csv`, and
+shown in the prompt-fidelity figure. This interface does not silently substitute CLIP for a
+structured evaluator.
 
 Evaluation writes `paired_metrics.csv`, `summary.csv`, and these figures under
 `<Q7_OUTPUT_DIR>/figures/`:
