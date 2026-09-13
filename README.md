@@ -2,6 +2,8 @@
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/BrendanGho/massive-activations-fig3/blob/main/Figure3_Colab.ipynb)
 
+Q9 text/image causal coupling: [![Open Q9 in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/BrendanGho/massive-activations-fig3/blob/main/Q9_Colab.ipynb)
+
 Experiments on how activation magnitude is distributed across channels and tokens in
 diffusion transformers: whether channel identities persist across generations, how much
 of a token's norm comes from a few channels, and how these patterns vary across models
@@ -16,6 +18,7 @@ and text/image streams.
 | Text/image streams | Which text positions have high norms, and are dominant channels shared with images? | Token-position profiles and within-model channel overlap |
 | Localization baseline | How do selected channels align with foreground pseudo-labels? | Per-layer top/bottom/random-k mIoU |
 | Q7 generation function | What causal role do registers, channel 154, and sink routing play during generation? | Same-seed interventions, perceptual/frequency effects, prompt-fidelity deltas, causal maps |
+| Q9 text/image coupling | Do text states seed, maintain, or read back from image registers? | T5/DiT discovery, paired forward probes, directed routing lesions, reverse lesions, rescue |
 
 ## Install and run
 
@@ -332,6 +335,88 @@ model or GPU after changing plotting code:
 ```bash
 python -m src.experiments.generation_function --config configs/q7_colab.json --plot
 ```
+
+## Q9: text states and image-register coupling
+
+Use [Q9_Colab.ipynb](Q9_Colab.ipynb) independently of the older notebook. Its model dropdown
+uses shared presets in `text_image_coupling.py` for FLUX.1-dev (28 steps, guidance 3.5) and
+Schnell (4 steps, guidance 0). The bidirectional adapter deliberately rejects PixArt:
+its static T5 conditioning cannot read back from the image DiT. See [SPEC_Q9.md](SPEC_Q9.md).
+
+- `smoke`: two calibration prompts, two held-out prompts, one seed/step, projected T5 input
+  and block 17. Tests all applicable methods, replay agreement, actual edits and cleanup.
+- `discovery`: 12 prompts x 2 seeds. Measures T5 and DiT token classes, norms, directions,
+  channel rankings and exact, chunked attention reductions at selected steps/layers.
+- `screen`: four held-out prompts x two seeds; individual transformer forwards branched
+  from identical clean latent states at selected denoising steps. No edited image decoding.
+- `confirm`: 24 additional prompts x three seeds; by default four text-state contrasts
+  plus four direction-removal rescue comparisons, at block 17/step 0. This is 576 edited
+  trajectories, so freeze a small contrast set after screening and review the printed budget.
+  Calibration is separate from evaluation and may be recomputed when sites/steps change.
+
+Every edit targets one site at one step. Site `-1` edits the output of the T5-to-DiT projection;
+nonnegative sites edit post-block text states. Routing methods target attention inside the
+selected block instead. Block-17 residual edits precede the hypothesized block-18 writer.
+The defaults are hypotheses, not automatic discovery of the correct birth layer.
+`readout_layer` defaults to block 39 for the causal map, while response curves retain all
+observed downstream blocks. Change the readout after inspecting independent calibration;
+an empty register population at a readout is missing evidence, not a zero causal effect.
+
+Operations include direction removal, exact resulting-norm matching, candidate-channel
+suppression, zeroing, same-class ordinary-token zeroing, norm/edit-energy-matched random
+rotations, and equal-token-class-layout donor swaps. Donor forwards hold the recipient image
+latent and pooled CLIP vector fixed. Native empty-prompt baselines are separately labelled;
+they are not represented as semantic-length-matched unconditional controls.
+
+Routing tests distinguish image queries reading candidate text, candidate text queries reading
+image registers, and candidate text queries reading content text. Score blocking renormalizes
+attention; value blocking removes only the selected weighted-value contribution. Reverse
+image-register lesions read out later text. Rescue restores either the clean image-register
+projection or its complete state, with ordinary-position and identity-patch comparisons.
+
+```bash
+pip install -e ".[q9]"
+python -m src.experiments.text_image_coupling --config /content/q9_config.json
+python -m src.experiments.text_image_coupling --config /content/q9_config.json --plot
+python -m src.experiments.text_image_coupling --config /content/q9_config.json \
+  --export-compact /content/drive/MyDrive/Research/MA/q9_compact
+```
+
+The Colab creates the config; its advanced cell exposes prompts, seeds, methods, sites,
+steps, candidate selection, and rescue settings. Pinning Diffusers 0.37.0 and Transformers
+4.57.6 is part of the tested Q9 adapter contract. CPU model-interface tests use miniature
+random FLUX/T5 networks; pretrained GPU runs and scientific outcomes require Colab execution.
+
+Results are under `output_dir/runs/<identity>/`. Main artifacts:
+
+- `paired_metrics.csv.gz`, `summary.csv`: internal paired effects and prompt-cluster CIs.
+- `audits.csv`, `manifest.json`: actual edits, token counts, invalid controls, exact job keys.
+- `birth.csv`: generic outlier onset and separately channel-dominated register onset
+  (mean selected-token channel energy >=0.5); absent birth remains missing.
+- `directions.csv`, `direction_stability.csv`, `t5_summary.csv`: calibration and text summaries.
+- `image_metrics.csv`, `image_summary.csv`: confirm-mode frequency, LPIPS and paired CLIP
+  scores; external structured/prompt-fidelity scores may also be merged.
+- `figures/`: norm atlas, direction energy, routing, causal response maps/curves and confirm
+  example image pairs. Blank cells have no eligible measurement, not a zero effect.
+
+External scores use unique `identity,job_id` keys from `manifest.json`. Supported clean/edited
+columns are `counting_{clean,edited}`, `attribute_{clean,edited}`, `spatial_{clean,edited}`,
+`overall_{clean,edited}` (all in [0,1]), and `image_reward_{clean,edited}` (finite scores).
+Set `structured_scores` to that CSV before evaluation. These are explicit integration points;
+Q9 does not silently claim to run GenEval or ImageReward when no scores are supplied.
+
+No-candidate, unavailable-direction and unmatched-control jobs remain in the audit but are
+excluded from causal summaries. One-prompt results have no confidence interval. Direction
+fits with <50% leading energy are flagged; single-axis lesions there do not establish absence
+of a higher-dimensional mechanism. Curves are exploratory unless contrasts were predefined;
+the code does not perform a family-wide multiple-testing correction or a semantic decoder.
+An optional equivalence bound applies only to image channel-energy changes, and does not
+by itself establish global independence of the streams.
+
+Raw activations, dense attention tensors and replay inputs are never serialized. Full PNGs
+and per-job records remain in `/content`. Drive export whitelists compact files and refuses
+exports larger than 250 MiB; it excludes the full image grid. Colab runtime reset loses the
+local work unless retained separately, so resume only skips exact completed local jobs.
 
 ## Stage 1 cache storage
 

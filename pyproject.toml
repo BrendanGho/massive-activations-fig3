@@ -12,6 +12,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+q9 = [
+    "numpy>=1.26", "torch>=2.4", "diffusers==0.37.0", "transformers==4.57.6",
+    "accelerate>=0.34", "pillow>=10.0", "matplotlib>=3.8", "scipy>=1.11",
+    "sentencepiece>=0.2.0", "protobuf>=4.25", "lpips>=0.1.4", "open_clip_torch>=2.26",
+]
 # Heavy, GPU/Colab-only deps for the Figure 3 reproduction pipeline. These are
 # imported lazily inside the model-touching stages (stage1 / stage4 / model_utils),
 # so the numeric core and the test suite do NOT require them. Install on Colab with:
