@@ -350,8 +350,13 @@ python -m src.experiments.generation_function --config configs/q7_colab.json --p
 
 ## Q9: text states and image-register coupling
 
-Use [Q9_Colab.ipynb](Q9_Colab.ipynb) independently of the older notebook. Its model dropdown
-uses shared presets in `text_image_coupling.py` for FLUX.1-dev (28 steps, guidance 3.5) and
+**No-code entry point:** open the main Colab and jump to **Part 6 — Q9**. Run its own
+**1. Setup**, select a model and mode in **2. Choose experiment**, then run **4. Run** and
+**5. Results**. Skip all earlier sections; do not use whole-notebook Run all for Q9 only.
+Step 3 contains optional form overrides, not required Python edits. The standalone
+[Q9_Colab.ipynb](Q9_Colab.ipynb) has the identical controls and can run independently.
+
+The model dropdown uses shared presets in `text_image_coupling.py` for FLUX.1-dev (28 steps, guidance 3.5) and
 Schnell (4 steps, guidance 0). The bidirectional adapter deliberately rejects PixArt:
 its static T5 conditioning cannot read back from the image DiT. See [SPEC_Q9.md](SPEC_Q9.md).
 
@@ -394,8 +399,17 @@ python -m src.experiments.text_image_coupling --config /content/q9_config.json \
   --export-compact /content/drive/MyDrive/Research/MA/q9_compact
 ```
 
-The Colab creates the config; its advanced cell exposes prompts, seeds, methods, sites,
-steps, candidate selection, and rescue settings. Pinning Diffusers 0.37.0 and Transformers
+The Colab creates and validates the config automatically. Blank advanced fields keep the
+presets; comma-separated fields accept seeds, methods, sites, steps and attention layers.
+Custom prompts use `||` separators; count 0 keeps all prompts. Calibration prompts/seeds,
+candidate selection, readout/rescue layers, memory mode, metrics and rescue settings also
+have form controls. Changing the basic-selection cell resets earlier advanced overrides.
+The run cell prints the budget before loading a model; confirm requires enabling
+`Q9_CONFIRM_FULL_RUN`, because its preset contains 576 edited trajectories. Unchecking
+`Q9_RUN_EXPERIMENT` previews the configuration without generating anything.
+Both notebooks provide optional compact Drive export, off by default.
+
+Pinning Diffusers 0.37.0 and Transformers
 4.57.6 is part of the tested Q9 adapter contract. CPU model-interface tests use miniature
 random FLUX/T5 networks; pretrained GPU runs and scientific outcomes require Colab execution.
 
