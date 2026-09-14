@@ -8,10 +8,31 @@ def _csv(value, convert=str):
 
 
 def build_config(
-    model="flux1-dev", mode="smoke", resolution="preset", *, vram_gib=40, bf16=True, advanced=None
+    model="flux1-dev",
+    mode="screen",
+    resolution="preset",
+    *,
+    workload="pilot",
+    vram_gib=40,
+    bf16=True,
+    advanced=None,
 ):
-    """Blank form fields preserve the scientific preset, not a hidden smaller grid."""
+    """Pilot is explicit; full retains the original grid. Form overrides apply last."""
+    if workload not in {"pilot", "full"}:
+        raise ValueError("workload must be pilot or full")
     cfg = preset_config(model, mode)
+    if workload == "pilot" and mode != "smoke":
+        # Independent calibration/evaluation, but intentionally too small for a final claim.
+        cfg.calibration_prompts = [cfg.calibration_prompts[i] for i in (0, 4, 8)]
+        cfg.calibration_seeds = [0]
+        indices = (0, 8, 16) if mode == "confirm" else (0, 2, 3)
+        cfg.prompts = [cfg.prompts[i] for i in indices]
+        cfg.seeds = [7]
+        cfg.sites, cfg.steps = [17], [0]
+        cfg.attention_layers = [17, 18, 19, 39]
+        cfg.methods = ["remove_direction", "norm_matched", "zero", "ordinary_zero"]
+        cfg.rescues = ["none"]
+        cfg.include_empty = False
     cfg.dtype = "bf16" if bf16 else "fp16"
     cfg.offload = vram_gib < 38
     if resolution != "preset":
@@ -54,7 +75,6 @@ def build_config(
             setattr(cfg, name, int(value))
     for name in (
         "candidate_source",
-        "include_empty",
         "optimize_probes",
         "skip_unavailable",
         "evaluate_lpips",
@@ -62,6 +82,11 @@ def build_config(
     ):
         if name in fields:
             setattr(cfg, name, fields.pop(name))
+    include_empty = fields.pop("include_empty", "preset")
+    if include_empty != "preset":
+        if include_empty not in (True, False, "yes", "no"):
+            raise ValueError("include_empty must be preset, yes or no")
+        cfg.include_empty = include_empty in (True, "yes")
     cfg.structured_scores = fields.pop("structured_scores", "").strip() or None
     if fields:
         raise ValueError(f"Unknown Q9 form settings: {sorted(fields)}")
@@ -69,6 +94,22 @@ def build_config(
         raise ValueError("Seeds must be nonnegative integers")
     cfg.validate()
     return cfg
+
+
+def show_results(cfg):
+    """Display after the run without requiring another notebook cell."""
+    from IPython.display import Image, display
+
+    from .q9_report import locate
+
+    result = locate(cfg)
+    print((result / "report_status.json").read_text())
+    for figure in sorted((result / "figures").glob("*.png")):
+        print(figure.name)
+        display(Image(filename=str(figure)))
+    print("Results:", result)
+    print("Check audits.csv and direction_stability.csv before interpreting a negative result.")
+    return result
 
 
 def run_budget(cfg):

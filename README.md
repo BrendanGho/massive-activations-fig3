@@ -351,10 +351,36 @@ python -m src.experiments.generation_function --config configs/q7_colab.json --p
 ## Q9: text states and image-register coupling
 
 **No-code entry point:** open the main Colab and jump to **Part 6 — Q9**. Run its own
-**1. Setup**, select a model and mode in **2. Choose experiment**, then run **4. Run** and
-**5. Results**. Skip all earlier sections; do not use whole-notebook Run all for Q9 only.
-Step 3 contains optional form overrides, not required Python edits. The standalone
+**1. Setup**, then **2. Run Q9 pilot**. The second cell selects the model/mode, runs the
+experiment and displays figures automatically. Skip all earlier sections; do not use
+whole-notebook Run all for Q9 only. The optional advanced form can be skipped. The standalone
 [Q9_Colab.ipynb](Q9_Colab.ipynb) has the identical controls and can run independently.
+
+Part 6 also explains the intervention families in plain language. They operationalize
+the Q9 causal questions; they are not all experiments from the original image-stream paper.
+Discovery observes the clean model, screen tests within-forward effects without completing
+edited images, and confirm tests selected edits through complete generations. These modes
+are workflow stages, not denoising phases. There is no automatic discovery-to-confirmation
+selection: review the results and set confirmation fields explicitly.
+
+The default **pilot** uses three evaluation prompts x one seed and three separate calibration
+prompts x one seed. It retains `remove_direction,norm_matched,zero,ordinary_zero` at block 17,
+denoising step 0, with attention readouts at 17/18/19/39. No extra channel, donor, random,
+routing, reverse, rescue, empty-prompt or layer/time-sweep conditions run by default.
+Calibration is automatic, so you can run screen directly without separate smoke/discovery.
+
+| Pilot mode | Uncached planned work, before unavailable/resume skips |
+| --- | --- |
+| discovery | 3 clean calibration trajectories |
+| screen (default) | 3 calibration + 3 clean evaluation trajectories, 12 edited forwards, 3 replay checks |
+| confirm | 3 calibration + 3 clean evaluation + 12 edited full trajectories, 3 replay checks |
+
+Screen intervention trials fall from 1,320 to 12; full-generation interventions fall from
+576 to 12. These are workload reductions, not measured wall-time speedups. Resolution and
+model denoising step count remain unchanged. The pilot asks only about pre-birth text influence;
+it cannot establish maintenance, read-back, prompt-general stability or independence.
+Three calibration prompts give only an exploratory direction fit. Pilot confirmation uses
+three new held-out prompts. The original larger study remains available via `Q9_WORKLOAD=full`:
 
 The model dropdown uses shared presets in `text_image_coupling.py` for FLUX.1-dev (28 steps, guidance 3.5) and
 Schnell (4 steps, guidance 0). The bidirectional adapter deliberately rejects PixArt:
@@ -403,9 +429,9 @@ The Colab creates and validates the config automatically. Blank advanced fields 
 presets; comma-separated fields accept seeds, methods, sites, steps and attention layers.
 Custom prompts use `||` separators; count 0 keeps all prompts. Calibration prompts/seeds,
 candidate selection, readout/rescue layers, memory mode, metrics and rescue settings also
-have form controls. Changing the basic-selection cell resets earlier advanced overrides.
-The run cell prints the budget before loading a model; confirm requires enabling
-`Q9_CONFIRM_FULL_RUN`, because its preset contains 576 edited trajectories. Unchecking
+have form controls. Setup resets advanced overrides; otherwise they apply last and are printed.
+The run cell prints the budget before loading a model; confirmation exceeding 12 edited jobs
+requires enabling `Q9_CONFIRM_FULL_RUN`. The full preset has 576 edited trajectories. Unchecking
 `Q9_RUN_EXPERIMENT` previews the configuration without generating anything.
 Both notebooks provide optional compact Drive export, off by default.
 
