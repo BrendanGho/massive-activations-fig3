@@ -286,15 +286,14 @@ its register zones and causal channel have not been calibrated for this design.
 
 The Colab defaults to `Q7_RUN_MODE="screen"`. Its cross-shaped design tests all three denoising
 phases at mid-register depth and all four depth zones during the middle phase (six unique cells),
-using one prompt/seed: 32 generations and 31 temporary PNGs rather than the full grid's 558
-generations and 549 PNGs. `smoke` runs seven generations solely as an API check; `full` retains
-the complete 3-prompt × 3-seed × 3-phase × 4-zone design. Screen mode estimates temporal and
+using **4 prompts × 1 seed**: 128 generations and 124 temporary PNGs rather than the
+full grid's 248 generations and 244 temporary PNGs. `smoke` runs seven generations solely
+as an API check; `full` uses the complete **4-prompt × 1-seed × 3-phase × 4-zone** design. Screen mode estimates temporal and
 depth main effects but cannot rule out phase-by-depth interactions, so confirm important cells
 or use `full` for the final factorial result.
 
-Set `Q7_SCREEN_PROMPTS=3` to screen three different prompts and obtain three contact
-sheets (approximately three times the default screen generation workload). Full mode
-already includes three prompts; smoke mode still uses one.
+Screen and full use four fixed prompts and one seed; smoke uses the first prompt and that same
+seed. Figures still render up to three distinct-prompt contact sheets, as configured previously.
 
 Q7's full PNG grid is written to `/content/q7_work`, not Google Drive. Raw residual and attention
 traces remain in memory and are never serialized. After evaluation, the notebook optionally
@@ -358,10 +357,10 @@ whole-notebook Run all for Q9 only. The optional advanced form can be skipped. T
 
 Part 6 also explains the intervention families in plain language. They operationalize
 the Q9 causal questions; they are not all experiments from the original image-stream paper.
-Discovery observes the clean model, screen tests within-forward effects without completing
-edited images, and confirm tests selected edits through complete generations. These modes
-are workflow stages, not denoising phases. There is no automatic discovery-to-confirmation
-selection: review the results and set confirmation fields explicitly.
+The Colab exposes only two Q9 modes. **Screen** performs calibration automatically and tests
+within-forward effects without completing edited images. **Confirm** performs calibration and
+tests the selected edits through complete generations. These are workflow stages, not denoising
+phases; smoke and discovery are not separate steps in the user-facing workflow.
 
 The default **pilot** uses three evaluation prompts x one seed and three separate calibration
 prompts x one seed. It retains `remove_direction,norm_matched,zero,ordinary_zero` at block 17,
@@ -371,7 +370,6 @@ Calibration is automatic, so you can run screen directly without separate smoke/
 
 | Pilot mode | Uncached planned work, before unavailable/resume skips |
 | --- | --- |
-| discovery | 3 clean calibration trajectories |
 | screen (default) | 3 calibration + 3 clean evaluation trajectories, 12 edited forwards, 3 replay checks |
 | confirm | 3 calibration + 3 clean evaluation + 12 edited full trajectories, 3 replay checks |
 
@@ -386,16 +384,13 @@ The model dropdown uses shared presets in `text_image_coupling.py` for FLUX.1-de
 Schnell (4 steps, guidance 0). The bidirectional adapter deliberately rejects PixArt:
 its static T5 conditioning cannot read back from the image DiT. See [SPEC_Q9.md](SPEC_Q9.md).
 
-- `smoke`: two calibration prompts, two held-out prompts, one seed/step, projected T5 input
-  and block 17. Tests all applicable methods, replay agreement, actual edits and cleanup.
-- `discovery`: 12 prompts x 2 seeds. Measures T5 and DiT token classes, norms, directions,
-  channel rankings and exact, chunked attention reductions at selected steps/layers.
-- `screen`: four held-out prompts x two seeds; individual transformer forwards branched
+- `screen`: individual transformer forwards branched
   from identical clean latent states at selected denoising steps. No edited image decoding.
 - `confirm`: 24 additional prompts x three seeds; by default four text-state contrasts
   plus four direction-removal rescue comparisons, at block 17/step 0. This is 576 edited
   trajectories, so freeze a small contrast set after screening and review the printed budget.
-  Calibration is separate from evaluation and may be recomputed when sites/steps change.
+  Calibration is separate from evaluation data but runs automatically, and may be recomputed
+  when sites/steps change. These counts describe the optional full workload, not the pilot.
 
 Every edit targets one site at one step. Site `-1` edits the output of the T5-to-DiT projection;
 nonnegative sites edit post-block text states. Routing methods target attention inside the

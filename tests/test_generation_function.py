@@ -246,7 +246,8 @@ def test_frequency_split_and_bootstrap():
 
 @pytest.mark.parametrize("n_prompts", [1, 3, 4])
 def test_generate_figures_from_smoke_metrics(tmp_path, n_prompts):
-    pytest.importorskip("matplotlib")
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
     image_module = pytest.importorskip("PIL.Image")
     conditions = [
         "remove_vstar",
@@ -498,6 +499,18 @@ def test_sink_processor_preserves_double_stream_text_output_identity():
     assert output[1] is text_sentinel
     assert attention.dropout_calls == 1
     assert counts[1] == 1 and fires[1] == 1
+
+
+def test_q7_colab_defaults_to_four_prompts_and_one_seed():
+    from pathlib import Path
+
+    notebook = json.loads(Path("Figure3_Colab.ipynb").read_text(encoding="utf-8"))
+    source = "".join("".join(cell.get("source", [])) for cell in notebook["cells"])
+    assert "q7_all_seeds = [0]" in source
+    assert 'q7_prompts = q7_all_prompts[:1] if Q7_RUN_MODE == "smoke" else q7_all_prompts' in source
+    prompt_block = source.split("q7_all_prompts = [", 1)[1].split("]", 1)[0]
+    assert prompt_block.count('\n    "') == 4
+    assert "Q7_SCREEN_PROMPTS" not in source
 
 
 def test_pixart_sink_processor_preserves_unconditional_cfg_row():

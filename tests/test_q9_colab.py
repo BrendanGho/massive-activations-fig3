@@ -108,6 +108,9 @@ def test_q9_cells_are_identical_and_self_contained_in_both_notebooks():
     text = "".join("".join(c["source"]) for c in standalone["cells"])
     assert "edit cfg." not in text
     assert "build_config(" in text and "Q9_CONFIRM_FULL_RUN" in text
+    run_cell = "".join(next(c["source"] for c in standalone["cells"] if c["id"] == "q9_run"))
+    assert "# @param ['screen', 'confirm']" in run_cell
+    assert "'discovery'" not in run_cell and "'smoke'" not in run_cell
     ids = [c.get("id") for c in main["cells"]]
     assert ids.index("q9_setup") < ids.index("XcA1FvnJhZlY")
 
