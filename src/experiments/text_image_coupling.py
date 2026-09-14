@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-REVISION = "q9-v1"
+REVISION = "q9-v2"
 PRESETS = {
     "flux1-dev": {
         "model_ckpt": "black-forest-labs/FLUX.1-dev",
@@ -83,6 +83,8 @@ class Q9Config:
     dtype: str = "bf16"
     device: str = "cuda"
     offload: bool = False
+    optimize_probes: bool = True
+    skip_unavailable: bool = True
     calibration_prompts: list[str] = field(default_factory=lambda: list(CALIBRATION_PROMPTS))
     calibration_seeds: list[int] = field(default_factory=lambda: [0, 42])
     prompts: list[str] = field(default_factory=lambda: list(SCREEN_PROMPTS))
@@ -302,9 +304,10 @@ class Reservoir:
         }
 
 
-def state_metrics(x, mask, vector=None, channel=None):
+def state_metrics(x, mask, vector=None, channel=None, norms=None):
     x = np.asarray(x, np.float32)
-    norms = np.linalg.norm(x, axis=-1)
+    if norms is None:
+        norms = np.linalg.norm(x, axis=-1)
     y = x[mask]
     result = {
         "count": int(mask.sum()),
@@ -313,7 +316,7 @@ def state_metrics(x, mask, vector=None, channel=None):
     }
     if not len(y):
         return result
-    yn = np.linalg.norm(y, axis=-1)
+    yn = norms[mask]
     result["selected_norm"] = float(yn.mean())
     if channel is not None:
         result["channel_abs"] = float(np.abs(y[:, channel]).mean())

@@ -204,6 +204,8 @@ def report(cfg):
                 image_path=str(image_path) if image_path.exists() else None,
                 image_metrics=item["image_metrics"],
                 elapsed_seconds=item["elapsed_seconds"],
+                execution=item.get("execution", "executed"),
+                work=item.get("work", {}),
             )
             manifest.append(meta)
             audits.extend({"job_id": job_id, **a} for a in item["audit"])

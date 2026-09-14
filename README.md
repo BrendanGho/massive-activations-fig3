@@ -292,6 +292,10 @@ the complete 3-prompt × 3-seed × 3-phase × 4-zone design. Screen mode estimat
 depth main effects but cannot rule out phase-by-depth interactions, so confirm important cells
 or use `full` for the final factorial result.
 
+Set `Q7_SCREEN_PROMPTS=3` to screen three different prompts and obtain three contact
+sheets (approximately three times the default screen generation workload). Full mode
+already includes three prompts; smoke mode still uses one.
+
 Q7's full PNG grid is written to `/content/q7_work`, not Google Drive. Raw residual and attention
 traces remain in memory and are never serialized. After evaluation, the notebook optionally
 copies only CSV/JSON audit files, the small `vstar` direction, and rendered figures to
@@ -328,6 +332,14 @@ Evaluation writes `paired_metrics.csv`, `summary.csv`, and these figures under
   bootstrap intervals and visible sample counts.
 - `q7_vstar_loadings.png` — the largest calibrated `v*` channel coefficients.
 - `q7_representative_contact_sheet.png` — clean, edited, and amplified-difference images.
+
+Contact sheets include up to three distinct prompts: the first keeps the filename above,
+and additional sheets use `q7_representative_contact_sheet_prompt_<id>.png`. Each sheet
+uses the first complete phase/depth/seed cell for its prompt in manifest order, with the
+prompt and settings printed above the images; examples are not selected by effect size.
+Plot labels use **Remove high-norm states** (zero selected token vectors) and
+**Renormalize high-norm tokens** (scale their norms to the ordinary-token median).
+The stored condition IDs `remove_top_registers` and `norm_only` remain unchanged.
 
 Figures are generated automatically by `--evaluate`. They can be regenerated without a
 model or GPU after changing plotting code:
@@ -386,6 +398,17 @@ The Colab creates the config; its advanced cell exposes prompts, seeds, methods,
 steps, candidate selection, and rescue settings. Pinning Diffusers 0.37.0 and Transformers
 4.57.6 is part of the tested Q9 adapter contract. CPU model-interface tests use miniature
 random FLUX/T5 networks; pretrained GPU runs and scientific outcomes require Colab execution.
+
+The default `Q9_OPTIMIZE_PROBES=True` reuses clean diagnostic rows only before the
+intervention can affect them, avoids redundant image-state transfers between adjacent
+observed blocks, and captures only required donor states. All post-intervention readouts
+are still measured; the attention probe keeps every query rather than subsampling.
+`Q9_SKIP_UNAVAILABLE=True` records missing candidates, directions, matched controls or
+rescue targets without running an ineffective edited trajectory. These jobs remain
+explicitly marked `skipped_unavailable`, never counted as successful interventions.
+Both switches can be disabled for comparison; per-job `work` counters record the saved
+diagnostics. These optimizations do not reduce the denoising steps or experimental grid,
+and do not imply a measured A100 speedup.
 
 Results are under `output_dir/runs/<identity>/`. Main artifacts:
 

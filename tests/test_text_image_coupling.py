@@ -425,3 +425,132 @@ def test_resume_requires_retained_images_in_confirmation(tmp_path):
     assert not rt.job_complete(tmp_path, "job", cfg)
     cfg.save_images = False
     assert rt.job_complete(tmp_path, "job", cfg)
+
+
+@pytest.mark.parametrize("method", ["zero", "image_reads_text_score", "text_reads_register_value"])
+def test_optimized_probes_preserve_predictions_and_every_readout(method):
+    import time
+
+    pipe, blocks, cfg, classes, kw = tiny_flux()
+    cfg.image_norm_threshold = 1.01
+    cfg.optimize_probes = False
+    bank = {
+        f"{stream}_{layer}": {"vector": np.eye(16, dtype=np.float32)[0], "channel": 0}
+        for stream in ("text", "image")
+        for layer in (-1, 0, 1, 2, 3)
+    }
+    baseline = rt.Q9Hooks(pipe, blocks, cfg, classes, bank)
+    with rt.installed(baseline):
+        rt.replay(pipe, kw)
+    observations, predictions, timings, workloads = [], [], [], []
+    for optimized in (False, True):
+        cfg.optimize_probes = optimized
+        hooks = rt.Q9Hooks(
+            pipe, blocks, cfg, classes, bank, baseline.trace, method, 2, 0, forced_step=0
+        )
+        start = time.perf_counter()
+        with rt.installed(hooks):
+            predictions.append(rt.replay(pipe, kw))
+        timings.append(time.perf_counter() - start)
+        hooks.validate(1)
+        observations.append(hooks.trace.rows)
+        workloads.append(hooks.work)
+    torch.testing.assert_close(predictions[0], predictions[1], atol=0, rtol=0)
+    assert observations[0] == observations[1]
+    assert workloads[1]["attention_computed"] < workloads[0]["attention_computed"]
+    assert workloads[1]["observations_computed"] < workloads[0]["observations_computed"]
+    print(
+        f"Q9 CPU fixture {method}: legacy={timings[0]:.4f}s fast={timings[1]:.4f}s; work={workloads}"
+    )
+
+
+def test_donor_capture_avoids_all_diagnostics_and_preserves_states():
+    pipe, blocks, cfg, classes, kw = tiny_flux()
+    cfg.sites = [-1, 0, 2]
+    baseline = rt.Q9Hooks(pipe, blocks, cfg, classes, forced_step=0)
+    with rt.installed(baseline):
+        expected = rt.replay(pipe, kw)
+    donor = rt.Q9Hooks(pipe, blocks, cfg, classes, forced_step=0, capture_only=True)
+    with rt.installed(donor):
+        actual = rt.replay(pipe, kw)
+    donor.validate(1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not donor.trace.rows and not donor.trace.snapshots and not donor.trace.inputs
+    assert donor.work["attention_computed"] == donor.work["observations_computed"] == 0
+    for layer in cfg.sites:
+        np.testing.assert_array_equal(
+            donor.trace.frames[(0, layer)]["text_full"],
+            baseline.trace.frames[(0, layer)]["text_full"],
+        )
+
+
+def test_optimized_multistep_trajectory_preserves_downstream_measurements():
+    pipe, blocks, cfg, classes, kw = tiny_flux()
+    cfg.steps = [0, 1, 2]
+    cfg.image_norm_threshold = 1.01
+
+    def trajectory(hooks):
+        latent = kw["hidden_states"].clone()
+        with rt.installed(hooks):
+            for _ in cfg.steps:
+                prediction = rt.replay(pipe, kw | {"hidden_states": latent})
+                latent = latent - 0.1 * prediction
+        hooks.validate(3)
+        return latent
+
+    cfg.optimize_probes = False
+    baseline = rt.Q9Hooks(pipe, blocks, cfg, classes)
+    trajectory(baseline)
+    legacy = rt.Q9Hooks(
+        pipe,
+        blocks,
+        cfg,
+        classes,
+        reference=baseline.trace,
+        condition="zero",
+        site=2,
+        target_step=1,
+    )
+    expected = trajectory(legacy)
+    cfg.optimize_probes = True
+    fast = rt.Q9Hooks(
+        pipe,
+        blocks,
+        cfg,
+        classes,
+        reference=baseline.trace,
+        condition="zero",
+        site=2,
+        target_step=1,
+    )
+    actual = trajectory(fast)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert fast.trace.rows == legacy.trace.rows
+    assert fast.work["attention_reused"] == 7  # four before the step, three before the site
+    assert fast.work["attention_computed"] == 5  # one downstream, four at the next step
+
+
+def test_prefix_reuse_stops_at_intervention_and_does_not_cross_later_steps():
+    pipe, blocks, cfg, classes, _kw = tiny_flux()
+    h = rt.Q9Hooks(pipe, blocks, cfg, classes, reference=rt.Trace(), site=2, target_step=1)
+    h.step = 0
+    assert h.clean_prefix(56)
+    h.step = 1
+    assert h.clean_prefix(1)
+    assert not h.clean_prefix(2)
+    assert h.clean_prefix(2, before_attention=True)
+    assert not h.clean_prefix(3, before_attention=True)
+    h.step = 2
+    assert not h.clean_prefix(-1)
+
+
+def test_preflight_marks_missing_controls_and_resume_needs_no_fake_image(tmp_path):
+    cfg = preset_config(mode="confirm")
+    trace = rt.Trace()
+    trace.frames[(0, 17)] = {"text_mask": np.array([True, False]), "text_control": None}
+    status = rt.unavailable_job(
+        cfg, trace, {}, np.array(["eos", "pad"]), None, "ordinary_zero", 17, 0, "none"
+    )
+    assert status == "no_matched_control"
+    rt.write_json(tmp_path / "job.json", {"execution": "skipped_unavailable"})
+    assert rt.job_complete(tmp_path, "job", cfg)

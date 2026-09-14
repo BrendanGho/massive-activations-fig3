@@ -244,7 +244,8 @@ def test_frequency_split_and_bootstrap():
     assert stats["n"] == 3 and stats["ci_low"] <= 2 <= stats["ci_high"]
 
 
-def test_generate_figures_from_smoke_metrics(tmp_path):
+@pytest.mark.parametrize("n_prompts", [1, 3, 4])
+def test_generate_figures_from_smoke_metrics(tmp_path, n_prompts):
     pytest.importorskip("matplotlib")
     image_module = pytest.importorskip("PIL.Image")
     conditions = [
@@ -275,13 +276,15 @@ def test_generate_figures_from_smoke_metrics(tmp_path):
     with (tmp_path / "paired_metrics.csv").open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fields)
         writer.writeheader()
-        for index, condition in enumerate(conditions, start=1):
+        for pid, index, condition in (
+            (pid, i, c) for pid in range(n_prompts) for i, c in enumerate(conditions, start=1)
+        ):
             writer.writerow(
                 {
                     "condition": condition,
                     "phase": "early",
                     "zone": "writer",
-                    "prompt_id": 0,
+                    "prompt_id": pid,
                     "seed": 0,
                     "clean_path": clean_path,
                     "image_path": edited_path,
@@ -297,21 +300,50 @@ def test_generate_figures_from_smoke_metrics(tmp_path):
     np.save(tmp_path / "vstar.npy", vstar)
     cfg = Q7Config(
         output_dir=str(tmp_path),
-        prompts=("test",),
+        prompts=tuple(f"test prompt {pid}" for pid in range(n_prompts)),
         channel=2,
         phases={"early": (0, 0)},
         zones={"writer": (0, 0)},
         num_steps=1,
     )
     outputs = generate_figures(cfg)
-    assert {path.name for path in outputs} == {
+    expected = {
         "q7_causal_map.png",
         "q7_frequency_profile.png",
         "q7_prompt_fidelity.png",
         "q7_vstar_loadings.png",
         "q7_representative_contact_sheet.png",
     }
+    expected.update(
+        f"q7_representative_contact_sheet_prompt_{pid:03d}.png"
+        for pid in range(1, min(n_prompts, 3))
+    )
+    assert {path.name for path in outputs} == expected
     assert all(path.stat().st_size > 0 for path in outputs)
+
+
+def test_contact_sheet_selection_uses_distinct_prompts_and_complete_cells(tmp_path):
+    from src.experiments.generation_function import contact_sheet_groups
+
+    available = tmp_path / "present.png"
+    available.touch()
+    rows = [
+        {
+            "prompt_id": pid,
+            "seed": seed,
+            "phase": "early",
+            "zone": "writer",
+            "condition": c,
+            "clean_path": str(available),
+            "image_path": str(available),
+        }
+        for pid, seed in ((0, 0), (0, 1), (1, 0), (2, 0), (3, 0))
+        for c in ("remove_vstar", "norm_only")
+    ]
+    rows[4]["image_path"] = str(tmp_path / "missing.png")
+    chosen = contact_sheet_groups(rows, ["remove_vstar", "norm_only"])
+    assert [group[0]["prompt_id"] for group in chosen] == [0, 2, 3]
+    assert all(group[0]["seed"] == 0 for group in chosen)
 
 
 def test_sink_condition_does_not_edit_residual_reference_operator():

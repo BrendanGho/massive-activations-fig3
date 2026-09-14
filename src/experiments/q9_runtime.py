@@ -173,11 +173,12 @@ def attention_reductions(
     if query.shape[0] != 1:
         raise RuntimeError("Q9 currently requires one scenario per forward")
     n, heads = query.shape[1:3]
+    key_float = key.float()
     incoming = torch.zeros((2, heads, n), device=query.device)
     entropy = torch.zeros((2, heads), device=query.device)
     for lo in range(0, n, chunk_size):
         hi = min(lo + chunk_size, n)
-        scores = torch.einsum("bqhd,bkhd->bhqk", query[:, lo:hi].float(), key.float())
+        scores = torch.einsum("bqhd,bkhd->bhqk", query[:, lo:hi].float(), key_float)
         p = (scores * query.shape[-1] ** -0.5).softmax(-1)[0]
         for group, take in enumerate(
             (
@@ -323,6 +324,7 @@ class Q9Hooks:
         donor=None,
         forced_step=None,
         collect=None,
+        capture_only=False,
     ):
         self.pipe, self.blocks, self.cfg, self.classes = pipe, blocks, cfg, classes
         self.bank, self.reference = bank or {}, reference
@@ -333,6 +335,21 @@ class Q9Hooks:
             rescue,
         )
         self.donor, self.forced_step, self.collect = donor, forced_step, collect
+        self.capture_only = capture_only
+        self.work = {
+            "observations_computed": 0,
+            "observations_reused": 0,
+            "attention_computed": 0,
+            "attention_reused": 0,
+            "input_image_transfers": 0,
+            "input_masks_reused": 0,
+        }
+        self.reference_rows = {}
+        if reference is not None:
+            for row in reference.rows:
+                self.reference_rows.setdefault(
+                    (row["step"], row["layer"], row["stage"]), []
+                ).append(row)
         self.trace, self.step = Trace(), -1
         self.handles, self.processors = [], []
         self.counts = {b.layer_id: 0 for b in blocks}
@@ -340,6 +357,23 @@ class Q9Hooks:
 
     def active(self, layer):
         return self.step == self.target_step and layer == self.site
+
+    def clean_prefix(self, layer, before_attention=False):
+        """No intervention has fired yet; downstream and later-step diagnostics stay live."""
+        return (
+            self.cfg.optimize_probes
+            and self.reference is not None
+            and (
+                self.step < self.target_step
+                or (
+                    self.step == self.target_step
+                    and (layer < self.site or (before_attention and layer == self.site))
+                )
+            )
+        )
+
+    def reuse_rows(self, layer, stage):
+        self.trace.rows.extend(self.reference_rows.get((self.step, layer, stage), ()))
 
     def direction(self, layer, stream):
         return self.bank.get(f"{stream}_{layer}", {}).get("vector")
@@ -358,7 +392,14 @@ class Q9Hooks:
 
     def record(self, layer, text, image=None):
         cfg, key = self.cfg, (self.step, layer)
+        if self.clean_prefix(layer):
+            self.trace.frames[key] = self.reference.frames[key]
+            self.reuse_rows(layer, "dit")
+            self.work["observations_reused"] += 1
+            return
+        self.work["observations_computed"] += 1
         arr = numpy(text)
+        text_norms = np.linalg.norm(arr, axis=-1) if cfg.optimize_probes else None
         sinks = self.trace.inputs.get(key, {}).get("sinks")
         mask, uncapped = select_text(arr, self.classes, cfg, sinks)
         frame = {"text_mask": mask, "text_control": matched_positions(arr, mask, self.classes)}
@@ -369,17 +410,16 @@ class Q9Hooks:
         ch = self.bank.get(f"text_{layer}", {}).get("channel")
         for cls in np.unique(self.classes):
             take = self.classes == cls
-            vals = state_metrics(arr, take, v, ch)
-            channel_energy = np.square(arr[take]).sum(0)
+            vals = state_metrics(arr, take, v, ch, text_norms)
+            squared = np.square(arr[take])
+            channel_energy = squared.sum(0)
             top = np.argsort(channel_energy)[-5:][::-1]
             vals.update(
                 top_channels=top.tolist(),
                 dominant_channel=int(top[0]),
                 dominant_energy=float(channel_energy[top[0]] / max(channel_energy.sum(), 1e-20)),
                 norm_excluding_dominant=float(
-                    np.sqrt(
-                        np.maximum(np.square(arr[take]).sum(-1) - arr[take, top[0]] ** 2, 0)
-                    ).mean()
+                    np.sqrt(np.maximum(squared.sum(-1) - arr[take, top[0]] ** 2, 0)).mean()
                 ),
             )
             self.row(layer, "text", cls, vals)
@@ -387,16 +427,20 @@ class Q9Hooks:
             layer,
             "text",
             "candidates",
-            state_metrics(arr, mask, v, ch)
+            state_metrics(arr, mask, v, ch, text_norms)
             | {"uncapped_count": uncapped, "positions": np.flatnonzero(mask).tolist()},
         )
         self.row(
-            layer, "text", "fixed", state_metrics(arr, ref["text_mask"] if ref else mask, v, ch)
+            layer,
+            "text",
+            "fixed",
+            state_metrics(arr, ref["text_mask"] if ref else mask, v, ch, text_norms),
         )
         if self.collect is not None:
             self.collect.setdefault(f"text_{layer}", Reservoir(cfg.reservoir_size)).add(arr[mask])
         if image is not None:
             ia = numpy(image)
+            image_norms = np.linalg.norm(ia, axis=-1) if cfg.optimize_probes else None
             im, count = norm_candidates(ia, cfg.image_norm_threshold, cfg.image_max_registers)
             control = matched_positions(ia, im, np.full(len(ia), "image"))
             frame.update(image_mask=im, image_control=control)
@@ -410,11 +454,16 @@ class Q9Hooks:
                 layer,
                 "image",
                 "registers",
-                state_metrics(ia, im, iv, cfg.image_channel)
+                state_metrics(ia, im, iv, cfg.image_channel, image_norms)
                 | {"uncapped_count": count, "positions": np.flatnonzero(im).tolist()},
             )
             fixed = ref["image_mask"] if ref else im
-            self.row(layer, "image", "fixed", state_metrics(ia, fixed, iv, cfg.image_channel))
+            self.row(
+                layer,
+                "image",
+                "fixed",
+                state_metrics(ia, fixed, iv, cfg.image_channel, image_norms),
+            )
             union = np.logical_or(im, fixed).sum()
             self.row(
                 layer,
@@ -460,22 +509,35 @@ class Q9Hooks:
             if args:
                 raise RuntimeError("Q9 replay requires keyword transformer inputs")
             self.step = self.forced_step if self.forced_step is not None else self.step + 1
+            self.reuse_interblock_masks = self.cfg.optimize_probes and not any(
+                kw.get(name) is not None
+                for name in ("controlnet_block_samples", "controlnet_single_block_samples")
+            )
             self.trace.timesteps[self.step] = kw["timestep"].detach().float().cpu().tolist()
             if self.step == 0:
                 raw = kw["hidden_states"].detach().float().cpu().numpy()
                 self.trace.noise_sha256 = hashlib.sha256(raw.tobytes()).hexdigest()
             if kw["hidden_states"].shape[0] != 1:
                 raise RuntimeError("Q9 supports batch size 1; no implicit CFG batch editing")
-            if self.step in self.cfg.steps and self.reference is None and self.collect is None:
+            if (
+                self.step in self.cfg.steps
+                and self.reference is None
+                and self.collect is None
+                and not self.capture_only
+            ):
                 self.trace.snapshots[self.step] = cpu_tree(kw)
 
         def final(_m, _args, out):
-            if self.step in self.cfg.steps:
+            if self.step in self.cfg.steps and not self.capture_only:
                 pred = out[0] if isinstance(out, tuple) else out.sample
                 self.trace.predictions[self.step] = pred.detach().cpu()
 
         def projected(_m, _args, out):
             if self.step not in self.cfg.steps:
+                return None
+            if self.capture_only:
+                if -1 in self.cfg.sites:
+                    self.trace.frames[(self.step, -1)] = {"text_full": numpy(out).copy()}
                 return None
             text, _ = self.state_edit(-1, out, None)
             self.record(-1, text)
@@ -488,22 +550,36 @@ class Q9Hooks:
                 self.pipe.transformer.context_embedder.register_forward_hook(projected),
             ]
         )
-        attention_layers = set(self.cfg.attention_layers) | {l for l in self.cfg.sites if l >= 0}
+        attention_layers = (
+            (set(self.cfg.attention_layers) | {l for l in self.cfg.sites if l >= 0})
+            if not self.capture_only
+            else set()
+        )
         for ref in self.blocks:
             layer = ref.layer_id
 
             def before(_m, args, kw, layer=layer):
                 if self.step not in self.cfg.steps or layer not in attention_layers:
                     return
+                key = (self.step, layer)
+                if self.clean_prefix(layer, before_attention=True):
+                    self.trace.inputs[key] = self.reference.inputs[key]
+                    return
                 image = kw.get("hidden_states", args[0] if args else None)
                 text = kw.get("encoder_hidden_states")
                 if text is None:
                     text, image = image[:, : self.nt], image[:, self.nt :]
-                ta, ia = numpy(text), numpy(image)
+                ta = numpy(text)
                 tm, _ = select_text(ta, self.classes, self.cfg)
-                im, _ = norm_candidates(
-                    ia, self.cfg.image_norm_threshold, self.cfg.image_max_registers
-                )
+                previous = self.trace.frames.get((self.step, layer - 1), {})
+                if self.reuse_interblock_masks and "image_mask" in previous:
+                    im = previous["image_mask"]
+                    self.work["input_masks_reused"] += 1
+                else:
+                    im, _ = norm_candidates(
+                        numpy(image), self.cfg.image_norm_threshold, self.cfg.image_max_registers
+                    )
+                    self.work["input_image_transfers"] += 1
                 self.trace.inputs[(self.step, layer)] = {
                     "text_mask": tm,
                     "image_mask": im,
@@ -515,6 +591,10 @@ class Q9Hooks:
                 if self.step not in self.cfg.steps:
                     return None
                 text, image = streams(out, self.nt)
+                if self.capture_only:
+                    if layer in self.cfg.sites:
+                        self.trace.frames[(self.step, layer)] = {"text_full": numpy(text).copy()}
+                    return None
                 text, image = self.state_edit(layer, text, image)
                 if (
                     self.rescue != "none"
@@ -616,39 +696,47 @@ class Q9Attention:
             raise RuntimeError(
                 "Q9 FLUX native path expected no DiT attention mask; refusing to ignore one"
             )
-        q, k, v = q7._flux_qkv(attn, hidden_states, encoder_hidden_states, image_rotary_emb)
         key = (h.step, self.layer)
-        frame = h.trace.inputs[key]
-        fixed = h.reference.inputs[key] if h.reference else frame
-        rows, incoming = attention_reductions(
-            q,
-            k,
-            h.nt,
-            frame["image_mask"],
-            h.classes,
-            h.cfg.query_chunk,
-            fixed["image_mask"],
-            fixed["text_mask"],
-        )
-        sinks = sink_mask(incoming, h.cfg)
-        frame["sinks"] = sinks
-        frame["text_mask"], _ = select_text(frame.pop("text_array"), h.classes, h.cfg, sinks)
-        for row in rows:
-            row["fixed_text_candidate_mass"] = float(
-                row.pop("_text_incoming")[fixed["text_mask"]].sum()
+        cached = h.clean_prefix(self.layer, before_attention=True)
+        if cached:
+            h.reuse_rows(self.layer, "attention_input")
+            h.work["attention_reused"] += 1
+            if not h.active(self.layer) or h.condition not in EDGE_METHODS:
+                return output
+        q, k, v = q7._flux_qkv(attn, hidden_states, encoder_hidden_states, image_rotary_emb)
+        if not cached:
+            h.work["attention_computed"] += 1
+            frame = h.trace.inputs[key]
+            fixed = h.reference.inputs[key] if h.reference else frame
+            rows, incoming = attention_reductions(
+                q,
+                k,
+                h.nt,
+                frame["image_mask"],
+                h.classes,
+                h.cfg.query_chunk,
+                fixed["image_mask"],
+                fixed["text_mask"],
             )
-            h.row(self.layer, "attention", row.pop("population"), row, "attention_input")
-        h.row(
-            self.layer,
-            "attention",
-            "text_candidates",
-            {
-                "sink_count": int(sinks.sum()),
-                "positions": np.flatnonzero(sinks).tolist(),
-                "overlap_count": int((sinks & frame["text_mask"]).sum()),
-            },
-            "attention_input",
-        )
+            sinks = sink_mask(incoming, h.cfg)
+            frame["sinks"] = sinks
+            frame["text_mask"], _ = select_text(frame.pop("text_array"), h.classes, h.cfg, sinks)
+            for row in rows:
+                row["fixed_text_candidate_mass"] = float(
+                    row.pop("_text_incoming")[fixed["text_mask"]].sum()
+                )
+                h.row(self.layer, "attention", row.pop("population"), row, "attention_input")
+            h.row(
+                self.layer,
+                "attention",
+                "text_candidates",
+                {
+                    "sink_count": int(sinks.sum()),
+                    "positions": np.flatnonzero(sinks).tolist(),
+                    "overlap_count": int((sinks & frame["text_mask"]).sum()),
+                },
+                "attention_input",
+            )
         if not h.active(self.layer) or h.condition not in EDGE_METHODS:
             return output
         reference = h.reference.inputs[key]
@@ -1034,9 +1122,55 @@ def calibrate(pipe, blocks, cfg, q7cfg, cache, root, provenance):
 
 
 def job_complete(folder, job_id, cfg):
-    return (folder / f"{job_id}.json").is_file() and (
-        cfg.mode != "confirm" or not cfg.save_images or (folder / f"{job_id}.png").is_file()
+    path = folder / f"{job_id}.json"
+    if not path.is_file():
+        return False
+    return (
+        cfg.mode != "confirm"
+        or not cfg.save_images
+        or (folder / f"{job_id}.png").is_file()
+        or json.loads(path.read_text()).get("execution") == "skipped_unavailable"
     )
+
+
+def unavailable_job(cfg, clean, bank, classes, donor, method, site, step, rescue):
+    """Skip only contrasts whose targets/controls are unavailable in the clean trace."""
+    if method in EDGE_METHODS:
+        frame = clean.inputs[(step, site)]
+        queries, keys = edge_indices(method, len(classes), len(frame["image_mask"]), frame, classes)
+        if not len(queries) or not len(keys):
+            return "no_candidates"
+    else:
+        reverse = method.startswith("image_")
+        stream = "image" if reverse else "text"
+        operation = method.removeprefix("image_") if reverse else method
+        frame = clean.frames[(step, site)]
+        mask = frame[f"{stream}_control" if operation == "ordinary_zero" else f"{stream}_mask"]
+        if mask is None:
+            return "no_matched_control"
+        if not mask.any():
+            return "no_candidates"
+        fitted = bank.get(f"{stream}_{site}", {})
+        if (
+            operation in {"remove_direction", "norm_matched", "random_direction"}
+            and fitted.get("vector") is None
+        ):
+            return "no_direction"
+        if operation == "suppress_channel" and fitted.get("channel") is None:
+            return "no_direction"
+        if operation == "donor_swap" and (donor is None or (step, site) not in donor.frames):
+            return "no_matched_donor"
+    if rescue != "none":
+        frame = clean.frames[(step, cfg.rescue_layer)]
+        mask = frame["image_control" if rescue == "ordinary_projection" else "image_mask"]
+        if mask is None or not mask.any():
+            return "unavailable_rescue"
+        if (
+            "projection" in rescue
+            and bank.get(f"image_{cfg.rescue_layer}", {}).get("vector") is None
+        ):
+            return "unavailable_rescue"
+    return None
 
 
 def run(cfg: Q9Config):
@@ -1175,7 +1309,15 @@ def run(cfg: Q9Config):
                 for step in cfg.steps:
                     snapshot = cpu_tree(clean.snapshots[step])
                     snapshot["encoder_hidden_states"] = cpu_tree(donor_cond["prompt_embeds"])
-                    dh = Q9Hooks(pipe, blocks, cfg, classes, bank, forced_step=step)
+                    dh = Q9Hooks(
+                        pipe,
+                        blocks,
+                        cfg,
+                        classes,
+                        bank,
+                        forced_step=step,
+                        capture_only=cfg.optimize_probes,
+                    )
                     with installed(dh):
                         replay(pipe, snapshot)
                     dh.validate(1)
@@ -1186,6 +1328,51 @@ def run(cfg: Q9Config):
                 if job_complete(folder, job_id, cfg):
                     continue
                 started = time.monotonic()
+                metadata = {
+                    "identity": identity,
+                    "prompt_id": pi,
+                    "seed": seed,
+                    "condition": method,
+                    "site": site,
+                    "target_step": step,
+                    "rescue": rescue,
+                }
+                unavailable = (
+                    unavailable_job(cfg, clean, bank, classes, donor, method, site, step, rescue)
+                    if cfg.skip_unavailable
+                    else None
+                )
+                if unavailable:
+                    write_json(
+                        path,
+                        metadata
+                        | {
+                            "prompt": prompt,
+                            "donor_prompt": donor_prompt,
+                            "execution": "skipped_unavailable",
+                            "audit": [
+                                {
+                                    "step": step,
+                                    "layer": site,
+                                    "status": unavailable,
+                                    "tokens": 0,
+                                    "delta_l2": 0.0,
+                                    "model_forwards": 0,
+                                }
+                            ],
+                            "paired": [],
+                            "birth": [],
+                            "positions": [],
+                            "image_metrics": {},
+                            "work": {"model_forwards": 0},
+                            "elapsed_seconds": time.monotonic() - started,
+                        },
+                    )
+                    print(
+                        f"  {index + 1}/{len(jobs)} {method} l={site} t={step}: skipped ({unavailable})",
+                        flush=True,
+                    )
+                    continue
                 hooks = Q9Hooks(
                     pipe,
                     blocks,
@@ -1211,15 +1398,6 @@ def run(cfg: Q9Config):
                 )
                 if cfg.mode == "confirm" and hooks.trace.noise_sha256 != clean.noise_sha256:
                     raise RuntimeError("Paired generation initial noise mismatch")
-                metadata = {
-                    "identity": identity,
-                    "prompt_id": pi,
-                    "seed": seed,
-                    "condition": method,
-                    "site": site,
-                    "target_step": step,
-                    "rescue": rescue,
-                }
                 paired = pair_rows(clean, hooks.trace, metadata)
                 diff = prediction.float() - clean.predictions[step].float()
                 paired.append(
@@ -1254,6 +1432,7 @@ def run(cfg: Q9Config):
                         "prompt": prompt,
                         "donor_prompt": donor_prompt,
                         "audit": hooks.trace.audit,
+                        "work": hooks.work,
                         "paired": paired,
                         "birth": birth_summary(hooks.trace),
                         "positions": [r for r in hooks.trace.rows if "positions" in r],

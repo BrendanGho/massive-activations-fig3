@@ -302,6 +302,30 @@ def _scenario_metric_values(rows: Iterable[dict[str, Any]], metric: str) -> list
     return [float(np.mean(values)) for values in grouped.values()]
 
 
+def contact_sheet_groups(rows, conditions, limit=3):
+    """First complete available cell per distinct prompt, in manifest order (not effect-ranked)."""
+    groups = {}
+    for row in rows:
+        if row.get("condition") not in conditions:
+            continue
+        key = tuple(row.get(k) for k in ("prompt_id", "seed", "phase", "zone"))
+        groups.setdefault(key, {})[row["condition"]] = row
+    chosen, prompts = [], set()
+    for key, group in groups.items():
+        if key[0] in prompts or any(c not in group for c in conditions):
+            continue
+        ordered = [group[c] for c in conditions]
+        if not all(
+            Path(r["clean_path"]).is_file() and Path(r["image_path"]).is_file() for r in ordered
+        ):
+            continue
+        chosen.append(ordered)
+        prompts.add(key[0])
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
 def generate_figures(cfg: Q7Config) -> list[Path]:
     """Render causal, frequency, fidelity, v* and representative image figures."""
     import matplotlib.pyplot as plt
@@ -324,8 +348,8 @@ def generate_figures(cfg: Q7Config) -> list[Path]:
         "remove_vstar": "Remove v*",
         "suppress_channel": f"Suppress channel {cfg.channel}",
         "suppress_sink": "Suppress sink",
-        "remove_top_registers": "Remove registers",
-        "norm_only": "Norm only",
+        "remove_top_registers": "Remove high-norm states",
+        "norm_only": "Renormalize high-norm tokens",
     }
     outputs = []
 
@@ -485,25 +509,29 @@ def generate_figures(cfg: Q7Config) -> list[Path]:
         plt.close(fig)
         outputs.append(path)
 
-    # Representative clean / edited / amplified-difference contact sheet.
-    first = rows[0]
-    representative = [
-        row
-        for row in rows
-        if row.get("prompt_id") == first.get("prompt_id")
-        and row.get("seed") == first.get("seed")
-        and row.get("phase") == first.get("phase")
-        and row.get("zone") == first.get("zone")
-    ]
-    representative.sort(key=lambda row: conditions.index(row["condition"]))
-    image_inputs_exist = representative and all(
-        Path(row["clean_path"]).exists() and Path(row["image_path"]).exists()
-        for row in representative
-    )
-    if image_inputs_exist:
+    # Up to three different prompts; each sheet preserves one seed/phase/zone throughout.
+    for sheet_index, representative in enumerate(contact_sheet_groups(rows, conditions)):
+        import textwrap
+
+        first = representative[0]
+        prompt_id = int(first["prompt_id"])
+        prompt = first.get("prompt") or (
+            cfg.prompts[prompt_id] if 0 <= prompt_id < len(cfg.prompts) else ""
+        )
+        lines = textwrap.wrap(str(prompt), width=100) or [""]
+        banner = 24 + 15 * len(lines)
         tile, header = 256, 42
-        sheet = Image.new("RGB", (3 * tile, len(representative) * (tile + header)), "white")
+        sheet = Image.new(
+            "RGB", (3 * tile, banner + len(representative) * (tile + header)), "white"
+        )
         draw = ImageDraw.Draw(sheet)
+        draw.text(
+            (6, 4),
+            f"Prompt {prompt_id} | seed {first['seed']} | {first['phase']} / {first['zone']}",
+            fill="black",
+        )
+        for li, line in enumerate(lines):
+            draw.text((6, 20 + 15 * li), line, fill="black")
         for ri, row in enumerate(representative):
             clean = Image.open(row["clean_path"]).convert("RGB").resize((tile, tile))
             edited = Image.open(row["image_path"]).convert("RGB").resize((tile, tile))
@@ -512,7 +540,7 @@ def generate_figures(cfg: Q7Config) -> list[Path]:
             difference = Image.fromarray(
                 np.clip(np.abs(clean_array - edited_array) * 4, 0, 255).astype(np.uint8)
             )
-            y = ri * (tile + header)
+            y = banner + ri * (tile + header)
             draw.text((6, y + 4), pretty.get(row["condition"], row["condition"]), fill="black")
             draw.text((6, y + 21), "clean", fill="#555555")
             draw.text((tile + 6, y + 21), "edited", fill="#555555")
@@ -520,7 +548,8 @@ def generate_figures(cfg: Q7Config) -> list[Path]:
             sheet.paste(clean, (0, y + header))
             sheet.paste(edited, (tile, y + header))
             sheet.paste(difference, (2 * tile, y + header))
-        path = figures / "q7_representative_contact_sheet.png"
+        suffix = "" if sheet_index == 0 else f"_prompt_{prompt_id:03d}"
+        path = figures / f"q7_representative_contact_sheet{suffix}.png"
         sheet.save(path)
         outputs.append(path)
 
