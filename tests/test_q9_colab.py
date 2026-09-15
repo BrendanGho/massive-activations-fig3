@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from src.experiments.q9_colab import build_config, run_budget
+from src.experiments.q9_colab import build_config, run_budget, run_experiment, run_logged
 from src.experiments.text_image_coupling import preset_config
 
 
@@ -124,6 +124,9 @@ def test_notebook_forms_run_without_earlier_sections_or_user_code(tmp_path, adva
     cells = {c["id"]: "".join(c["source"]) for c in nb["cells"]}
     commands = []
     monkeypatch.setattr("src.experiments.q9_colab.show_results", lambda cfg: "shown")
+    monkeypatch.setattr(
+        "src.experiments.q9_colab.run_experiment", lambda path, **kwargs: commands.append(path)
+    )
     namespace = {
         "Q9_REPO_DIR": "/content/massive-activations-fig3",
         "torch": SimpleNamespace(
@@ -140,7 +143,7 @@ def test_notebook_forms_run_without_earlier_sections_or_user_code(tmp_path, adva
         exec(cells["q9_advanced"], namespace)
     exec(cells["q9_run"], namespace)
     assert len(commands) == 1 and namespace["q9_finished"]
-    assert "src.experiments.text_image_coupling" in commands[0]
+    assert commands[0] == namespace["Q9_CONFIG_PATH"]
     saved = json.loads((tmp_path / Path(namespace["Q9_CONFIG_PATH"]).name).read_text())
     assert saved == asdict(build_config())
     assert namespace["q9_result"] == "shown"
@@ -182,3 +185,53 @@ def test_notebook_failed_run_stays_unfinished():
     with pytest.raises(ValueError, match="step out"):
         exec(cells["q9_run"], namespace)
     assert not namespace["q9_finished"]
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_child_output_and_failure_are_visible_and_logged(tmp_path, capsys, exit_code):
+    import sys
+
+    log = tmp_path / "q9.log"
+    cmd = [
+        sys.executable,
+        "-u",
+        "-c",
+        (
+            "import sys; print('child progress'); print('underlying diagnostic', file=sys.stderr); "
+            f"sys.exit({exit_code})"
+        ),
+    ]
+    if exit_code:
+        with pytest.raises(RuntimeError, match="underlying diagnostic"):
+            run_logged(cmd, log)
+    else:
+        assert run_logged(cmd, log) == log
+    output = capsys.readouterr().out
+    assert "child progress" in output and "underlying diagnostic" in output
+    assert "underlying diagnostic" in log.read_text()
+
+
+def test_experiment_wrapper_uses_current_interpreter_and_config(tmp_path, monkeypatch):
+    import sys
+
+    captured = []
+
+    def capture(command, log_path, cwd):
+        captured.append((command, log_path, cwd))
+        return log_path
+
+    monkeypatch.setattr("src.experiments.q9_colab.run_logged", capture)
+    cfg = tmp_path / "config.json"
+    first = run_experiment(cfg, cwd=tmp_path)
+    second = run_experiment(cfg, cwd=tmp_path)
+    command, _, cwd = captured[0]
+    assert command == [
+        sys.executable,
+        "-u",
+        "-m",
+        "src.experiments.text_image_coupling",
+        "--config",
+        str(cfg.resolve()),
+    ]
+    assert cwd == tmp_path and first.parent == tmp_path / "q9_logs"
+    assert first != second

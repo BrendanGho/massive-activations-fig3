@@ -1,5 +1,11 @@
 """No-code Colab configuration shared by the main and standalone Q9 notebooks."""
 
+import subprocess
+import sys
+import time
+from collections import deque
+from pathlib import Path
+
 from .text_image_coupling import EDGE_METHODS, PRESETS, preset_config
 
 
@@ -94,6 +100,70 @@ def build_config(
         raise ValueError("Seeds must be nonnegative integers")
     cfg.validate()
     return cfg
+
+
+def run_logged(command, log_path, cwd=None):
+    """Forward child stdout/stderr into notebook output and retain a bounded local log."""
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    tail = deque(maxlen=60)
+    remaining = 5 * 1024 * 1024
+    print(f"Q9 run log: {log_path}", flush=True)
+    with log_path.open("w", encoding="utf-8") as log:
+        with subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        ) as process:
+            try:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    tail.append(line[-4096:])
+                    if remaining > 0:
+                        piece = line.encode("utf-8")[:remaining].decode("utf-8", errors="ignore")
+                        log.write(piece)
+                        log.flush()
+                        remaining = max(0, remaining - len(line.encode("utf-8")))
+                code = process.wait()
+            except BaseException:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise
+        if remaining <= 0:
+            log.write("\n[Log truncated; final output follows]\n" + "".join(tail))
+    if code:
+        raise RuntimeError(
+            f"Q9 exited with status {code}. Full error output is above. "
+            f"Send the final traceback or local log: {log_path}\n\n" + "".join(tail)
+        )
+    return log_path
+
+
+def run_experiment(config_path, cwd=None):
+    """Use the notebook interpreter and preserve a separate log for each attempt."""
+    config_path = Path(config_path).resolve()
+    log_path = config_path.parent / "q9_logs" / f"{config_path.stem}_{time.time_ns()}.log"
+    return run_logged(
+        [
+            sys.executable,
+            "-u",
+            "-m",
+            "src.experiments.text_image_coupling",
+            "--config",
+            str(config_path),
+        ],
+        log_path,
+        cwd=cwd,
+    )
 
 
 def show_results(cfg):

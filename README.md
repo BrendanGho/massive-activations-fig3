@@ -433,6 +433,16 @@ requires enabling `Q9_CONFIRM_FULL_RUN`. The full preset has 576 edited trajecto
 `Q9_RUN_EXPERIMENT` previews the configuration without generating anything.
 Both notebooks provide optional compact Drive export, off by default.
 
+If a run fails, send the underlying traceback displayed above the failure, or download
+the attempt's log from `/content/q9_logs/`. The launcher forwards stdout and stderr into
+the cell and keeps a bounded text log locally; it does not save activations. Keep the
+runtime open while diagnosing so partial results remain available. An exit status alone
+does not identify the cause. For scientific follow-up, useful files from the matching
+`runs/<identity>/` folder are `config.json`, `report_status.json`, `audits.csv`,
+`direction_stability.csv`, `directions.csv`, `summary.csv`, and (for completed images)
+`image_metrics.csv` plus `figures/q9_example_pairs.png`. If reporting never completed,
+the available calibration JSON and `p*_s*/baseline.json`/job JSON files can still help.
+
 Pinning Diffusers 0.37.0 and Transformers
 4.57.6 is part of the tested Q9 adapter contract. CPU model-interface tests use miniature
 random FLUX/T5 networks; pretrained GPU runs and scientific outcomes require Colab execution.
