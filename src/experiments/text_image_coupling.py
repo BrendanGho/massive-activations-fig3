@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-REVISION = "q9-v2"
+REVISION = "q9-v3"
 PRESETS = {
     "flux1-dev": {
         "model_ckpt": "black-forest-labs/FLUX.1-dev",

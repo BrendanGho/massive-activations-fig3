@@ -6,6 +6,7 @@ import csv
 import gzip
 import json
 import shutil
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -532,6 +533,10 @@ def report(cfg):
         {
             "jobs": len(manifest),
             "effective_jobs": sum(m["eligible_for_summary"] for m in manifest),
+            "status_counts": dict(Counter(m["status"] for m in manifest)),
+            "control_note": "ordinary_zero requires a distinct noncandidate token of the same "
+            "class for every selected token. A selected singleton EOS has no such match; "
+            "no_matched_control is missing evidence for candidate specificity.",
             "calibrated_low_energy_directions": [
                 r["direction"] for r in direction_rows if r["energy"] < 0.5
             ],

@@ -349,6 +349,9 @@ python -m src.experiments.generation_function --config configs/q7_colab.json --p
 
 ## Q9: text states and image-register coupling
 
+See [the text-stream audit and prioritized follow-ups](Q9_TEXT_STREAM_NEXT_STEPS.md) for
+what the pilot actually tests, its control limitations, and small additional experiments.
+
 **No-code entry point:** open the main Colab and jump to **Part 6 — Q9**. Run its own
 **1. Setup**, then **2. Run Q9 pilot**. The second cell selects the model/mode, runs the
 experiment and displays figures automatically. Skip all earlier sections; do not use

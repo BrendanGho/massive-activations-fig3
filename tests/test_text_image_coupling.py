@@ -124,6 +124,29 @@ def test_edge_score_and_value_have_distinct_meanings():
     torch.testing.assert_close(patched[:, untouched], clean[:, untouched], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("source", ["norm", "sink", "union", "intersection"])
+def test_norm_sink_overlap_is_independent_of_candidate_union(monkeypatch, source):
+    pipe, blocks, cfg, classes, kw = tiny_flux()
+    cfg.candidate_source = source
+    cfg.text_norm_threshold = 1e6  # no norm outliers, but one genuine sink criterion
+    monkeypatch.setattr(rt, "sink_mask", lambda incoming, config: np.array([0, 0, 1, 0], bool))
+    clean = rt.replay(pipe, kw)
+    hooks = rt.Q9Hooks(pipe, blocks, cfg, classes)
+    with rt.installed(hooks):
+        traced = rt.replay(pipe, kw)
+    torch.testing.assert_close(traced, clean, atol=0, rtol=0)
+    rows = [
+        r
+        for r in hooks.trace.rows
+        if r["stage"] == "attention_input" and r["population"] == "text_candidates"
+    ]
+    assert len(rows) == len(blocks)
+    for row in rows:
+        assert row["sink_count"] == row["eligible_sink_count"] == 1
+        assert row["norm_count"] == row["overlap_count"] == 0
+        assert row["candidate_count"] == int(source in {"sink", "union"})
+
+
 def tiny_flux():
     from diffusers import FluxTransformer2DModel
 

@@ -4,7 +4,11 @@ Status: FLUX runner, reports, CPU integration tests and standalone Q9 Colab impl
 Pretrained GPU experiments have not been executed locally. Primary model: FLUX.1-dev.
 
 Implementation entry point: `python -m src.experiments.text_image_coupling --config ...`.
-`Q9_Colab.ipynb` creates model-preset-based discovery/smoke/screen/confirm configurations.
+The Q9 section in `Figure3_Colab.ipynb` and the standalone `Q9_Colab.ipynb` expose Screen
+and Confirm, with calibration automatic. The default pilot uses three prompts, one seed
+and four text-state contrasts at post-block 17 / step 0. Legacy discovery/smoke configs
+remain supported by the CLI. See [the audit and follow-ups](Q9_TEXT_STREAM_NEXT_STEPS.md)
+for implementation checks, interpretation limits and small additional experiments.
 The sections below retain the scientific design, including optional follow-ups. The current
 release fits and tests a single leading direction, flags weak single-axis fits, and leaves
 subspace interventions, a semantic decoder, and family-wide multiplicity correction as

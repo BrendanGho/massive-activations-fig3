@@ -720,7 +720,13 @@ class Q9Attention:
             )
             sinks = sink_mask(incoming, h.cfg)
             frame["sinks"] = sinks
-            frame["text_mask"], _ = select_text(frame.pop("text_array"), h.classes, h.cfg, sinks)
+            input_text = frame.pop("text_array")
+            frame["text_mask"], _ = select_text(input_text, h.classes, h.cfg, sinks)
+            # Norm/sink overlap must compare independent criteria, not sinks against
+            # the selected union (which includes ordinary-norm sinks by definition).
+            norm_mask, _ = norm_candidates(input_text, h.cfg.text_norm_threshold)
+            eligible = np.isin(h.classes, h.cfg.candidate_classes)
+            norm_mask &= eligible
             for row in rows:
                 row["fixed_text_candidate_mass"] = float(
                     row.pop("_text_incoming")[fixed["text_mask"]].sum()
@@ -733,7 +739,13 @@ class Q9Attention:
                 {
                     "sink_count": int(sinks.sum()),
                     "positions": np.flatnonzero(sinks).tolist(),
-                    "overlap_count": int((sinks & frame["text_mask"]).sum()),
+                    "eligible_sink_count": int((sinks & eligible).sum()),
+                    "norm_count": int(norm_mask.sum()),
+                    "norm_positions": np.flatnonzero(norm_mask).tolist(),
+                    "candidate_count": int(frame["text_mask"].sum()),
+                    "candidate_positions": np.flatnonzero(frame["text_mask"]).tolist(),
+                    "candidate_source": h.cfg.candidate_source,
+                    "overlap_count": int((sinks & norm_mask).sum()),
                 },
                 "attention_input",
             )
